@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import sqlite3
 from pathlib import Path
 
@@ -7,46 +8,111 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from fetch_openalex import connect, fetch_page, upsert_work
+
 DB_PATH = Path("erjor_citations.sqlite")
+DEFAULT_MAILTO = "freddy.frost@lhch.nhs.uk"
 
 st.set_page_config(page_title="ERJOR Citation Trends", layout="wide")
 st.title("ERJ Open Research citation trends")
 st.caption("Free prototype using OpenAlex citation counts and local daily snapshots.")
+
+
+def snapshot_exists_for_today(db_path: Path) -> bool:
+    if not db_path.exists():
+        return False
+    try:
+        con = sqlite3.connect(db_path)
+        today = dt.date.today().isoformat()
+        row = con.execute(
+            "SELECT COUNT(*) FROM citation_snapshots WHERE snapshot_date = ?", (today,)
+        ).fetchone()
+        con.close()
+        return bool(row and row[0] > 0)
+    except sqlite3.Error:
+        return False
+
+
+def fetch_latest_data(db_path: Path, mailto: str = DEFAULT_MAILTO) -> int:
+    """Fetch today's ERJOR snapshot from OpenAlex into SQLite."""
+    con = connect(str(db_path))
+    cursor = "*"
+    total = 0
+    snapshot_date = dt.date.today().isoformat()
+
+    progress = st.progress(0, text="Fetching ERJOR works from OpenAlex...")
+    while True:
+        data = fetch_page(cursor, mailto)
+        results = data.get("results", [])
+        if not results:
+            break
+        with con:
+            for work in results:
+                upsert_work(con, work, snapshot_date)
+                total += 1
+        progress.progress(min(95, total % 200), text=f"Fetched {total:,} works...")
+        next_cursor = data.get("meta", {}).get("next_cursor")
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    con.close()
+    progress.progress(100, text=f"Fetched {total:,} ERJOR works.")
+    return total
+
 
 @st.cache_data(ttl=300)
 def load_data(db_path: str):
     if not Path(db_path).exists():
         return pd.DataFrame(), pd.DataFrame()
     con = sqlite3.connect(db_path)
-    works = pd.read_sql_query("SELECT * FROM works", con)
-    snaps = pd.read_sql_query(
-        """
-        SELECT s.snapshot_date, s.openalex_id, s.cited_by_count,
-               w.title, w.doi, w.publication_date, w.publication_year,
-               w.authors, w.institutions, w.landing_page_url
-        FROM citation_snapshots s
-        JOIN works w USING(openalex_id)
-        """,
-        con,
-    )
-    con.close()
+    try:
+        works = pd.read_sql_query("SELECT * FROM works", con)
+        snaps = pd.read_sql_query(
+            """
+            SELECT s.snapshot_date, s.openalex_id, s.cited_by_count,
+                   w.title, w.doi, w.publication_date, w.publication_year,
+                   w.authors, w.institutions, w.landing_page_url
+            FROM citation_snapshots s
+            JOIN works w USING(openalex_id)
+            """,
+            con,
+        )
+    except Exception:
+        works, snaps = pd.DataFrame(), pd.DataFrame()
+    finally:
+        con.close()
     if not snaps.empty:
         snaps["snapshot_date"] = pd.to_datetime(snaps["snapshot_date"])
         snaps["publication_date"] = pd.to_datetime(snaps["publication_date"], errors="coerce")
     return works, snaps
 
+
+with st.sidebar:
+    st.header("Data refresh")
+    mailto = st.text_input("OpenAlex mailto", value=DEFAULT_MAILTO)
+    auto_refresh = st.checkbox("Auto-fetch today's data", value=True)
+    manual_refresh = st.button("Fetch latest data now")
+
+if manual_refresh or (auto_refresh and not snapshot_exists_for_today(DB_PATH)):
+    try:
+        fetched = fetch_latest_data(DB_PATH, mailto=mailto.strip() or DEFAULT_MAILTO)
+        st.success(f"Fetched {fetched:,} ERJOR works from OpenAlex.")
+        load_data.clear()
+    except Exception as exc:
+        st.error(f"Could not fetch OpenAlex data: {exc}")
+
 works, snaps = load_data(str(DB_PATH))
 
 if snaps.empty:
-    st.warning("No data yet. Run: python fetch_openalex.py --mailto your.email@example.com")
+    st.warning("No citation data is available yet. Use 'Fetch latest data now' in the sidebar.")
     st.stop()
 
 latest_date = snaps["snapshot_date"].max()
 latest = snaps[snaps["snapshot_date"] == latest_date].copy()
 
-# Work-level trend deltas.
 pivot = snaps.pivot_table(index="openalex_id", columns="snapshot_date", values="cited_by_count", aggfunc="max")
 all_dates = sorted(snaps["snapshot_date"].unique())
+
 
 def delta_since(days: int) -> pd.Series:
     target = latest_date - pd.Timedelta(days=days)
@@ -55,6 +121,7 @@ def delta_since(days: int) -> pd.Series:
         return pd.Series(0, index=pivot.index)
     prior = max(prior_dates)
     return (pivot[latest_date] - pivot[prior]).fillna(0).astype(int)
+
 
 latest = latest.set_index("openalex_id")
 latest["gain_7d"] = delta_since(7)
