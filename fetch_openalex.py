@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sqlite3
+from calendar import monthrange
 import time
 from typing import Any
 
@@ -19,6 +20,8 @@ import requests
 DB_PATH = "erjor_citations.sqlite"
 OPENALEX_BASE = "https://api.openalex.org/works"
 ERJOR_ISSN = "2312-0541"
+DEFAULT_MIN_AGE_MONTHS = 12
+DEFAULT_MAX_AGE_MONTHS = 36
 
 SELECT_FIELDS = ",".join([
     "id",
@@ -69,6 +72,30 @@ def connect(db_path: str) -> sqlite3.Connection:
     return con
 
 
+
+def add_months(date_value: dt.date, months: int) -> dt.date:
+    month = date_value.month - 1 + months
+    year = date_value.year + month // 12
+    month = month % 12 + 1
+    day = min(date_value.day, monthrange(year, month)[1])
+    return dt.date(year, month, day)
+
+
+def publication_window(
+    as_of: dt.date | None = None,
+    min_age_months: int = DEFAULT_MIN_AGE_MONTHS,
+    max_age_months: int = DEFAULT_MAX_AGE_MONTHS,
+) -> tuple[str, str]:
+    """Return publication_date bounds for papers min-max months old.
+
+    Default: papers published 12-36 months before today.
+    Bounds are inclusive and returned as ISO date strings.
+    """
+    as_of = as_of or dt.date.today()
+    start_date = add_months(as_of, -max_age_months)
+    end_date = add_months(as_of, -min_age_months)
+    return start_date.isoformat(), end_date.isoformat()
+
 def safe_get(obj: dict[str, Any] | None, path: list[str], default: Any = None) -> Any:
     cur: Any = obj or {}
     for key in path:
@@ -101,9 +128,16 @@ def extract_institutions(authorships: list[dict[str, Any]]) -> str:
     return "; ".join(institutions)
 
 
-def fetch_page(cursor: str, mailto: str | None) -> dict[str, Any]:
+def fetch_page(cursor: str, mailto: str | None, start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
+    if start_date is None or end_date is None:
+        start_date, end_date = publication_window()
+    filters = [
+        f"primary_location.source.issn:{ERJOR_ISSN}",
+        f"from_publication_date:{start_date}",
+        f"to_publication_date:{end_date}",
+    ]
     params = {
-        "filter": f"primary_location.source.issn:{ERJOR_ISSN}",
+        "filter": ",".join(filters),
         "select": SELECT_FIELDS,
         "per-page": 200,
         "cursor": cursor,
@@ -168,13 +202,17 @@ def main() -> None:
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--mailto", default=None, help="Recommended by OpenAlex for polite API usage")
     parser.add_argument("--snapshot-date", default=dt.date.today().isoformat())
+    parser.add_argument("--min-age-months", type=int, default=DEFAULT_MIN_AGE_MONTHS, help="Youngest papers to include. Default: 12 months old.")
+    parser.add_argument("--max-age-months", type=int, default=DEFAULT_MAX_AGE_MONTHS, help="Oldest papers to include. Default: 36 months old.")
     args = parser.parse_args()
 
     con = connect(args.db)
+    as_of = dt.date.fromisoformat(args.snapshot_date)
+    start_date, end_date = publication_window(as_of, args.min_age_months, args.max_age_months)
     cursor = "*"
     total = 0
     while True:
-        data = fetch_page(cursor, args.mailto)
+        data = fetch_page(cursor, args.mailto, start_date, end_date)
         results = data.get("results", [])
         if not results:
             break
@@ -187,7 +225,7 @@ def main() -> None:
             break
         cursor = next_cursor
         time.sleep(0.2)
-    print(f"Saved {total} ERJOR works for snapshot {args.snapshot_date} into {args.db}")
+    print(f"Saved {total} ERJOR works published {start_date} to {end_date} for snapshot {args.snapshot_date} into {args.db}")
 
 
 if __name__ == "__main__":

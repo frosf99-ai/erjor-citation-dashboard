@@ -8,14 +8,14 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from fetch_openalex import connect, fetch_page, upsert_work
+from fetch_openalex import DEFAULT_MAX_AGE_MONTHS, DEFAULT_MIN_AGE_MONTHS, connect, fetch_page, publication_window, upsert_work
 
 DB_PATH = Path("erjor_citations.sqlite")
 DEFAULT_MAILTO = "freddy.frost@lhch.nhs.uk"
 
 st.set_page_config(page_title="ERJOR Citation Trends", layout="wide")
 st.title("ERJ Open Research citation trends")
-st.caption("Free prototype using OpenAlex citation counts and local daily snapshots.")
+st.caption("Free prototype using OpenAlex citation counts and local daily snapshots. Default view: ERJOR papers published 12-36 months ago.")
 
 
 def snapshot_exists_for_today(db_path: Path) -> bool:
@@ -33,16 +33,17 @@ def snapshot_exists_for_today(db_path: Path) -> bool:
         return False
 
 
-def fetch_latest_data(db_path: Path, mailto: str = DEFAULT_MAILTO) -> int:
+def fetch_latest_data(db_path: Path, mailto: str = DEFAULT_MAILTO, min_age_months: int = DEFAULT_MIN_AGE_MONTHS, max_age_months: int = DEFAULT_MAX_AGE_MONTHS) -> int:
     """Fetch today's ERJOR snapshot from OpenAlex into SQLite."""
     con = connect(str(db_path))
     cursor = "*"
     total = 0
     snapshot_date = dt.date.today().isoformat()
+    start_date, end_date = publication_window(dt.date.today(), min_age_months, max_age_months)
 
-    progress = st.progress(0, text="Fetching ERJOR works from OpenAlex...")
+    progress = st.progress(0, text=f"Fetching ERJOR works published {start_date} to {end_date} from OpenAlex...")
     while True:
-        data = fetch_page(cursor, mailto)
+        data = fetch_page(cursor, mailto, start_date, end_date)
         results = data.get("results", [])
         if not results:
             break
@@ -50,13 +51,13 @@ def fetch_latest_data(db_path: Path, mailto: str = DEFAULT_MAILTO) -> int:
             for work in results:
                 upsert_work(con, work, snapshot_date)
                 total += 1
-        progress.progress(min(95, total % 200), text=f"Fetched {total:,} works...")
+        progress.progress(min(95, total % 200), text=f"Fetched {total:,} works in the 12-36 month window...")
         next_cursor = data.get("meta", {}).get("next_cursor")
         if not next_cursor or next_cursor == cursor:
             break
         cursor = next_cursor
     con.close()
-    progress.progress(100, text=f"Fetched {total:,} ERJOR works.")
+    progress.progress(100, text=f"Fetched {total:,} ERJOR works published {start_date} to {end_date}.")
     return total
 
 
@@ -90,12 +91,16 @@ def load_data(db_path: str):
 with st.sidebar:
     st.header("Data refresh")
     mailto = st.text_input("OpenAlex mailto", value=DEFAULT_MAILTO)
+    min_age_months = st.number_input("Youngest papers, months old", min_value=0, max_value=120, value=DEFAULT_MIN_AGE_MONTHS, step=1)
+    max_age_months = st.number_input("Oldest papers, months old", min_value=int(min_age_months), max_value=240, value=DEFAULT_MAX_AGE_MONTHS, step=1)
+    window_start, window_end = publication_window(dt.date.today(), int(min_age_months), int(max_age_months))
+    st.caption(f"Current publication window: {window_start} to {window_end}")
     auto_refresh = st.checkbox("Auto-fetch today's data", value=True)
     manual_refresh = st.button("Fetch latest data now")
 
 if manual_refresh or (auto_refresh and not snapshot_exists_for_today(DB_PATH)):
     try:
-        fetched = fetch_latest_data(DB_PATH, mailto=mailto.strip() or DEFAULT_MAILTO)
+        fetched = fetch_latest_data(DB_PATH, mailto=mailto.strip() or DEFAULT_MAILTO, min_age_months=int(min_age_months), max_age_months=int(max_age_months))
         st.success(f"Fetched {fetched:,} ERJOR works from OpenAlex.")
         load_data.clear()
     except Exception as exc:
@@ -109,6 +114,14 @@ if snaps.empty:
 
 latest_date = snaps["snapshot_date"].max()
 latest = snaps[snaps["snapshot_date"] == latest_date].copy()
+# Keep the visible dashboard focused on the chosen paper-age window.
+window_start_dt = pd.to_datetime(window_start)
+window_end_dt = pd.to_datetime(window_end)
+latest = latest[(latest["publication_date"] >= window_start_dt) & (latest["publication_date"] <= window_end_dt)].copy()
+snaps = snaps[snaps["openalex_id"].isin(latest["openalex_id"])]
+if latest.empty:
+    st.warning(f"No ERJOR papers found for publication dates {window_start} to {window_end}. Try widening the month range or fetch again.")
+    st.stop()
 
 pivot = snaps.pivot_table(index="openalex_id", columns="snapshot_date", values="cited_by_count", aggfunc="max")
 all_dates = sorted(snaps["snapshot_date"].unique())
@@ -130,10 +143,10 @@ latest["gain_90d"] = delta_since(90)
 latest = latest.reset_index()
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Articles tracked", f"{latest['openalex_id'].nunique():,}")
+col1.metric("Articles in 12-36m window", f"{latest['openalex_id'].nunique():,}")
 col2.metric("Total citations", f"{latest['cited_by_count'].sum():,}")
 col3.metric("Citations gained, 30d", f"{int(latest['gain_30d'].sum()):,}")
-col4.metric("Latest snapshot", latest_date.date().isoformat())
+col4.metric("Publication window", f"{window_start} to {window_end}")
 
 st.divider()
 
@@ -146,7 +159,7 @@ st.plotly_chart(px.line(total_by_day, x="snapshot_date", y="cited_by_count", mar
 st.subheader("New citations by snapshot")
 st.plotly_chart(px.bar(total_by_day, x="snapshot_date", y="new_citations"), use_container_width=True)
 
-st.subheader("Fastest-rising papers")
+st.subheader("Fastest-rising papers published 12-36 months ago")
 window = st.radio("Momentum window", ["7d", "30d", "90d"], horizontal=True, index=1)
 metric_col = {"7d": "gain_7d", "30d": "gain_30d", "90d": "gain_90d"}[window]
 top = latest.sort_values(metric_col, ascending=False).head(20)
@@ -181,7 +194,7 @@ cohorts = latest.groupby("publication_year", as_index=False).agg(
 cohorts["citations_per_paper"] = (cohorts["citations"] / cohorts["papers"]).round(1)
 st.dataframe(cohorts.sort_values("publication_year", ascending=False), use_container_width=True, hide_index=True)
 
-st.subheader("Search articles")
+st.subheader("Search articles in the selected age window")
 q = st.text_input("Filter by title, DOI, author, or institution")
 filtered = latest.copy()
 if q:
