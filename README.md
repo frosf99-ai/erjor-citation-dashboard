@@ -1,69 +1,65 @@
-# ERJOR OpenAlex Citation Trends Dashboard
+# ERJOR Editorial Intelligence Dashboard
 
-Free dashboard for ERJ Open Research citation trends using OpenAlex and SQLite. The default analysis focuses on papers published 12-36 months ago.
+A free Streamlit dashboard for ERJ Open Research using OpenAlex data.
 
-## Easiest Windows launch
+## What it shows
 
-1. Extract the ZIP file.
-2. Open the extracted folder.
-3. Double-click `START_DASHBOARD.bat`.
+### 1. Citation performance: 12-36 months
+- Total papers published 12-36 months ago
+- Estimated citations accrued in the first 12 months after publication
+- Current total citations
+- Median first-year citations
+- Proportion with >=10 estimated first-year citations
+- Citation trend for the cohort
 
-On first run it will:
+Important: OpenAlex does not provide exact month-level historical citing dates in the free Works endpoint. The app estimates first-12-month citations from OpenAlex `counts_by_year` annual buckets. It also stores daily snapshots from the day the app starts running, which improves future trend analysis.
 
-- create a local Python environment in `.venv`,
-- install the free packages,
-- download ERJOR citation data from OpenAlex for papers published 12-36 months ago,
-- open the dashboard in your browser.
+### 2. New papers: 0-12 months
+- Total papers published in the last 12 months
+- Article type breakdown: review, original research, editorial, correspondence, etc.
+- Multi-theme breakdown
+- Papers already being cited regularly
+- Citations/month
 
-Leave the black command window open while using the dashboard.
+### 3. Top 25 papers
+- Title
+- First author
+- Theme/topic tags
+- Citation count
+- Estimated first-12-month citations
+- Date/year of publication
+- Article type
+- DOI/link
 
-## Requirements
+### 4. Topic momentum
+- Themes ranked by citation momentum
+- Papers per theme
+- Total citations
+- 30/90-day gains when daily snapshots are available
+- Citations per paper
+- Top paper in each theme
 
-You need Python 3 installed on Windows. Install from python.org and tick **Add Python to PATH**.
+## Theme tagging
 
-## Manual commands
+Themes are non-exclusive. A paper can have more than one tag.
 
-```cmd
-pip install -r requirements.txt
-python fetch_openalex.py --mailto your.email@example.com
+Disease/content themes include bronchiectasis, COPD, asthma, ILD, pulmonary vascular disease, respiratory infection, lung cancer, sleep medicine, pulmonary rehabilitation, critical care, respiratory physiology, imaging, digital health, airway disease, environmental/occupational lung disease, and rare lung disease.
 
-# Optional: change the paper-age window
-python fetch_openalex.py --min-age-months 12 --max-age-months 36 --mailto your.email@example.com
-streamlit run app.py
-```
+Research type tags include clinical research, basic science, translational research, epidemiology, health services research, clinical trials, systematic review/meta-analysis, artificial intelligence, and implementation science.
 
-## Optional: build a Windows EXE launcher
+The current classifier uses title, OpenAlex concepts/topics/keywords, and article metadata. It is deliberately transparent and editable in `app.py`.
 
-A true `.exe` has to be built on Windows. Once Python is installed, double-click:
+## Deploy on Streamlit Community Cloud
 
-```cmd
-BUILD_WINDOWS_EXE.bat
-```
+1. Upload these files to your GitHub repository:
+   - `app.py`
+   - `fetch_openalex.py`
+   - `requirements.txt`
+2. In Streamlit Community Cloud, deploy with:
+   - Main file path: `app.py`
+   - Branch: usually `main`
+3. Open the app and click **Fetch latest data now** in the sidebar.
 
-If successful, the executable will appear at:
+## Notes on citation counts
 
-```cmd
-dist\ERJOR_Citation_Dashboard.exe
-```
-
-Note: this `.exe` is a launcher for the dashboard. It still uses the bundled project files and local Python packages created by the build process.
-
-## What the dashboard shows
-
-- tracked ERJOR papers in the selected publication-age window,
-- total citation count,
-- 7/30/90-day citation gains,
-- total citations over time,
-- new citations by snapshot,
-- fastest-rising papers,
-- citation age curve,
-- publication-year cohort performance within the selected window,
-- article search by title, DOI, author, or institution.
-
-## Important note about trends
-
-OpenAlex provides the current citation count. Trends appear after you run the dashboard on multiple days because the app stores one local snapshot per day in `erjor_citations.sqlite`.
-
-## Publication-age window
-
-By default, the app tracks ERJOR papers published between 12 and 36 months before today. This is designed to show papers old enough to have citation activity but recent enough to be editorially useful. You can adjust this in the Streamlit sidebar.
+OpenAlex and Google Scholar use different indexing methods, so counts will not always match. Google Scholar is usually broader and often higher. This app should be treated as an OpenAlex-based editorial intelligence tool, not a replacement for Google Scholar or Scopus.

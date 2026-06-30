@@ -1,15 +1,20 @@
 """Fetch ERJ Open Research citation snapshots from OpenAlex.
 
-Run daily, e.g.:
+The dashboard can call these functions directly on Streamlit Cloud, so users do
+not need to run this script manually. If you do run it locally:
+
     python fetch_openalex.py --mailto your.email@example.com
 
-The script stores one snapshot per work per day in SQLite. OpenAlex gives the
-current cited_by_count; this local history lets the dashboard calculate trends.
+OpenAlex provides current citation counts, not exact month-by-month historical
+citation dates for every citing work. The dashboard therefore stores daily
+snapshots locally and uses OpenAlex counts_by_year to estimate early citation
+activity where exact first-12-month counts are unavailable.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sqlite3
 from calendar import monthrange
 import time
@@ -30,11 +35,17 @@ SELECT_FIELDS = ",".join([
     "publication_date",
     "publication_year",
     "cited_by_count",
+    "counts_by_year",
     "authorships",
     "primary_location",
     "locations_count",
     "type",
+    "type_crossref",
     "ids",
+    "concepts",
+    "primary_topic",
+    "topics",
+    "keywords",
 ])
 
 
@@ -50,10 +61,16 @@ def connect(db_path: str) -> sqlite3.Connection:
             publication_date TEXT,
             publication_year INTEGER,
             work_type TEXT,
+            article_type TEXT,
             source_display_name TEXT,
             landing_page_url TEXT,
             authors TEXT,
+            first_author TEXT,
             institutions TEXT,
+            concepts_json TEXT,
+            topics_json TEXT,
+            keywords_json TEXT,
+            counts_by_year_json TEXT,
             updated_at TEXT NOT NULL
         )
         """
@@ -69,8 +86,20 @@ def connect(db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    # Lightweight migrations for older local databases.
+    cols = {row[1] for row in con.execute("PRAGMA table_info(works)").fetchall()}
+    migrations = {
+        "article_type": "ALTER TABLE works ADD COLUMN article_type TEXT",
+        "first_author": "ALTER TABLE works ADD COLUMN first_author TEXT",
+        "concepts_json": "ALTER TABLE works ADD COLUMN concepts_json TEXT",
+        "topics_json": "ALTER TABLE works ADD COLUMN topics_json TEXT",
+        "keywords_json": "ALTER TABLE works ADD COLUMN keywords_json TEXT",
+        "counts_by_year_json": "ALTER TABLE works ADD COLUMN counts_by_year_json TEXT",
+    }
+    for col, sql in migrations.items():
+        if col not in cols:
+            con.execute(sql)
     return con
-
 
 
 def add_months(date_value: dt.date, months: int) -> dt.date:
@@ -86,15 +115,11 @@ def publication_window(
     min_age_months: int = DEFAULT_MIN_AGE_MONTHS,
     max_age_months: int = DEFAULT_MAX_AGE_MONTHS,
 ) -> tuple[str, str]:
-    """Return publication_date bounds for papers min-max months old.
-
-    Default: papers published 12-36 months before today.
-    Bounds are inclusive and returned as ISO date strings.
-    """
     as_of = as_of or dt.date.today()
     start_date = add_months(as_of, -max_age_months)
     end_date = add_months(as_of, -min_age_months)
     return start_date.isoformat(), end_date.isoformat()
+
 
 def safe_get(obj: dict[str, Any] | None, path: list[str], default: Any = None) -> Any:
     cur: Any = obj or {}
@@ -107,13 +132,13 @@ def safe_get(obj: dict[str, Any] | None, path: list[str], default: Any = None) -
     return cur
 
 
-def extract_authors(authorships: list[dict[str, Any]]) -> str:
+def extract_authors(authorships: list[dict[str, Any]]) -> tuple[str, str]:
     names = []
     for a in authorships or []:
         name = safe_get(a, ["author", "display_name"])
         if name:
             names.append(name)
-    return "; ".join(names)
+    return "; ".join(names), (names[0] if names else "")
 
 
 def extract_institutions(authorships: list[dict[str, Any]]) -> str:
@@ -126,6 +151,24 @@ def extract_institutions(authorships: list[dict[str, Any]]) -> str:
                 seen.add(name)
                 institutions.append(name)
     return "; ".join(institutions)
+
+
+def infer_article_type(work: dict[str, Any]) -> str:
+    raw = " ".join(str(x or "") for x in [work.get("type"), work.get("type_crossref")]).lower()
+    title = str(work.get("display_name") or "").lower()
+    if "review" in raw or "systematic review" in title or "meta-analysis" in title or "meta analysis" in title:
+        return "Review"
+    if "editorial" in raw or title.startswith("editorial"):
+        return "Editorial"
+    if "letter" in raw or "correspondence" in raw:
+        return "Correspondence"
+    if "case-report" in raw or "case report" in title:
+        return "Case report"
+    if "brief-report" in raw or "short report" in title:
+        return "Short report"
+    if "article" in raw or "journal-article" in raw:
+        return "Original research"
+    return work.get("type") or "Unknown"
 
 
 def fetch_page(cursor: str, mailto: str | None, start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
@@ -153,23 +196,31 @@ def fetch_page(cursor: str, mailto: str | None, start_date: str | None = None, e
 def upsert_work(con: sqlite3.Connection, work: dict[str, Any], snapshot_date: str) -> None:
     location = work.get("primary_location") or {}
     source = location.get("source") or {}
+    authors, first_author = extract_authors(work.get("authorships", []))
     con.execute(
         """
         INSERT INTO works (
             openalex_id, doi, title, publication_date, publication_year,
-            work_type, source_display_name, landing_page_url, authors,
-            institutions, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            work_type, article_type, source_display_name, landing_page_url,
+            authors, first_author, institutions, concepts_json, topics_json,
+            keywords_json, counts_by_year_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(openalex_id) DO UPDATE SET
             doi=excluded.doi,
             title=excluded.title,
             publication_date=excluded.publication_date,
             publication_year=excluded.publication_year,
             work_type=excluded.work_type,
+            article_type=excluded.article_type,
             source_display_name=excluded.source_display_name,
             landing_page_url=excluded.landing_page_url,
             authors=excluded.authors,
+            first_author=excluded.first_author,
             institutions=excluded.institutions,
+            concepts_json=excluded.concepts_json,
+            topics_json=excluded.topics_json,
+            keywords_json=excluded.keywords_json,
+            counts_by_year_json=excluded.counts_by_year_json,
             updated_at=excluded.updated_at
         """,
         (
@@ -179,10 +230,16 @@ def upsert_work(con: sqlite3.Connection, work: dict[str, Any], snapshot_date: st
             work.get("publication_date"),
             work.get("publication_year"),
             work.get("type"),
+            infer_article_type(work),
             source.get("display_name"),
             location.get("landing_page_url"),
-            extract_authors(work.get("authorships", [])),
+            authors,
+            first_author,
             extract_institutions(work.get("authorships", [])),
+            json.dumps(work.get("concepts") or []),
+            json.dumps({"primary_topic": work.get("primary_topic"), "topics": work.get("topics") or []}),
+            json.dumps(work.get("keywords") or []),
+            json.dumps(work.get("counts_by_year") or []),
             dt.datetime.now(dt.UTC).isoformat(),
         ),
     )
@@ -197,34 +254,40 @@ def upsert_work(con: sqlite3.Connection, work: dict[str, Any], snapshot_date: st
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--db", default=DB_PATH)
-    parser.add_argument("--mailto", default=None, help="Recommended by OpenAlex for polite API usage")
-    parser.add_argument("--snapshot-date", default=dt.date.today().isoformat())
-    parser.add_argument("--min-age-months", type=int, default=DEFAULT_MIN_AGE_MONTHS, help="Youngest papers to include. Default: 12 months old.")
-    parser.add_argument("--max-age-months", type=int, default=DEFAULT_MAX_AGE_MONTHS, help="Oldest papers to include. Default: 36 months old.")
-    args = parser.parse_args()
-
-    con = connect(args.db)
-    as_of = dt.date.fromisoformat(args.snapshot_date)
-    start_date, end_date = publication_window(as_of, args.min_age_months, args.max_age_months)
+def fetch_window(db_path: str, mailto: str | None, start_date: str, end_date: str, snapshot_date: str | None = None) -> int:
+    snapshot_date = snapshot_date or dt.date.today().isoformat()
+    con = connect(db_path)
     cursor = "*"
     total = 0
     while True:
-        data = fetch_page(cursor, args.mailto, start_date, end_date)
+        data = fetch_page(cursor, mailto, start_date, end_date)
         results = data.get("results", [])
         if not results:
             break
         with con:
             for work in results:
-                upsert_work(con, work, args.snapshot_date)
+                upsert_work(con, work, snapshot_date)
                 total += 1
         next_cursor = data.get("meta", {}).get("next_cursor")
         if not next_cursor or next_cursor == cursor:
             break
         cursor = next_cursor
         time.sleep(0.2)
+    con.close()
+    return total
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", default=DB_PATH)
+    parser.add_argument("--mailto", default=None, help="Recommended by OpenAlex for polite API usage")
+    parser.add_argument("--snapshot-date", default=dt.date.today().isoformat())
+    parser.add_argument("--min-age-months", type=int, default=DEFAULT_MIN_AGE_MONTHS)
+    parser.add_argument("--max-age-months", type=int, default=DEFAULT_MAX_AGE_MONTHS)
+    args = parser.parse_args()
+    as_of = dt.date.fromisoformat(args.snapshot_date)
+    start_date, end_date = publication_window(as_of, args.min_age_months, args.max_age_months)
+    total = fetch_window(args.db, args.mailto, start_date, end_date, args.snapshot_date)
     print(f"Saved {total} ERJOR works published {start_date} to {end_date} for snapshot {args.snapshot_date} into {args.db}")
 
 
