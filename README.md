@@ -1,6 +1,6 @@
 # ERJOR OpenAlex Citation Trends Dashboard
 
-Free local dashboard for ERJ Open Research citation trends using OpenAlex and SQLite.
+Free dashboard for ERJ Open Research citation trends using OpenAlex and SQLite. The default analysis focuses on papers published 12-36 months ago.
 
 ## Easiest Windows launch
 
@@ -12,7 +12,7 @@ On first run it will:
 
 - create a local Python environment in `.venv`,
 - install the free packages,
-- download ERJOR citation data from OpenAlex,
+- download ERJOR citation data from OpenAlex for papers published 12-36 months ago,
 - open the dashboard in your browser.
 
 Leave the black command window open while using the dashboard.
@@ -25,7 +25,10 @@ You need Python 3 installed on Windows. Install from python.org and tick **Add P
 
 ```cmd
 pip install -r requirements.txt
-python fetch_openalex.py
+python fetch_openalex.py --mailto your.email@example.com
+
+# Optional: change the paper-age window
+python fetch_openalex.py --min-age-months 12 --max-age-months 36 --mailto your.email@example.com
 streamlit run app.py
 ```
 
@@ -47,16 +50,20 @@ Note: this `.exe` is a launcher for the dashboard. It still uses the bundled pro
 
 ## What the dashboard shows
 
-- total tracked ERJOR papers,
+- tracked ERJOR papers in the selected publication-age window,
 - total citation count,
 - 7/30/90-day citation gains,
 - total citations over time,
 - new citations by snapshot,
 - fastest-rising papers,
 - citation age curve,
-- publication-year cohort performance,
+- publication-year cohort performance within the selected window,
 - article search by title, DOI, author, or institution.
 
 ## Important note about trends
 
 OpenAlex provides the current citation count. Trends appear after you run the dashboard on multiple days because the app stores one local snapshot per day in `erjor_citations.sqlite`.
+
+## Publication-age window
+
+By default, the app tracks ERJOR papers published between 12 and 36 months before today. This is designed to show papers old enough to have citation activity but recent enough to be editorially useful. You can adjust this in the Streamlit sidebar.
