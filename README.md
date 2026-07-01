@@ -99,3 +99,9 @@ The denominator includes articles/research papers and reviews where identifiable
 ### Cumulative IF citation tracker
 
 The Impact Factor page includes a tracker showing cumulative citations across Jan-Dec for the selected IF year, with the previous year as a comparison. You can switch between monthly and weekly views. Because the lightweight OpenAlex work record provides `counts_by_year` rather than exact citation dates, the tracker prorates annual citation buckets across the selected periods. It is therefore best treated as a live directional tracker rather than an official Web of Science monthly citation feed.
+
+## V4.2 update
+
+The Impact Factor page now includes a cumulative citation tracker for the selected IF year plus the three previous IF years. The selected year is highlighted and earlier years are shown with reduced opacity for context. Monthly and weekly views are available.
+
+Note: monthly/weekly curves are OpenAlex-based estimates. OpenAlex summary data is annual, so the app prorates annual citation buckets across the selected time periods unless individual citing-work dates are available.

@@ -739,35 +739,57 @@ def impact_factor_page(snaps: pd.DataFrame) -> None:
 
     section_title(
         "Cumulative IF citation tracker",
-        f"Cumulative citations during {selected_year} to citable ERJOR papers published {selected_year-2}–{selected_year-1}, compared with {selected_year-1}."
+        f"Cumulative citations during {selected_year} to citable ERJOR papers published {selected_year-2}–{selected_year-1}, with the three previous IF years faded for comparison."
     )
     tracker_freq = st.radio("Tracker granularity", ["Monthly", "Weekly"], horizontal=True, key="if_tracker_frequency")
-    _, previous_citable, _, _ = eif_for_year(latest, int(selected_year) - 1)
-    current_curve = cumulative_if_citations(citable, int(selected_year), tracker_freq)
-    previous_curve = cumulative_if_citations(previous_citable, int(selected_year) - 1, tracker_freq)
-    tracker = pd.concat([current_curve, previous_curve], ignore_index=True)
-    tracker["series"] = tracker["year"].astype(str)
-    fig_tracker = px.line(
-        tracker,
-        x="period_index",
-        y="cumulative_citations",
-        color="series",
-        markers=True,
-        hover_data={"period": True, "date": True, "period_index": False, "series": False},
-        color_discrete_sequence=[ERJ_RED, ERJ_BLUE],
-    )
-    tick_df = tracker[tracker["year"] == int(selected_year)].drop_duplicates("period_index")
-    fig_tracker.update_xaxes(
-        tickmode="array",
-        tickvals=tick_df["period_index"].tolist(),
-        ticktext=tick_df["period"].tolist(),
-        title="Month" if tracker_freq == "Monthly" else "Week",
-    )
+
+    comparison_years = [int(selected_year) - i for i in range(4)]
+    curves = []
+    for y in comparison_years:
+        _, y_citable, _, _ = eif_for_year(latest, y)
+        curve = cumulative_if_citations(y_citable, y, tracker_freq)
+        curve["series"] = curve["year"].astype(str)
+        curves.append(curve)
+    tracker = pd.concat(curves, ignore_index=True) if curves else pd.DataFrame()
+
+    fig_tracker = go.Figure()
+    series_styles = {
+        int(selected_year): {"color": ERJ_RED, "opacity": 1.0, "width": 4},
+        int(selected_year) - 1: {"color": ERJ_BLUE, "opacity": 0.58, "width": 3},
+        int(selected_year) - 2: {"color": ERJ_TEAL, "opacity": 0.38, "width": 2.5},
+        int(selected_year) - 3: {"color": ERJ_GREY, "opacity": 0.28, "width": 2.5},
+    }
+    for y in comparison_years:
+        d = tracker[tracker["year"] == y].copy()
+        if d.empty:
+            continue
+        style = series_styles.get(y, {"color": ERJ_GREY, "opacity": 0.35, "width": 2})
+        fig_tracker.add_trace(go.Scatter(
+            x=d["period_index"],
+            y=d["cumulative_citations"],
+            mode="lines+markers",
+            name=str(y),
+            line=dict(color=style["color"], width=style["width"]),
+            marker=dict(color=style["color"], size=7),
+            opacity=style["opacity"],
+            customdata=d[["period", "date"]],
+            hovertemplate="IF year %{fullData.name}<br>%{customdata[0]} (%{customdata[1]})<br>Cumulative citations: %{y}<extra></extra>",
+            connectgaps=False,
+        ))
+
+    tick_df = tracker[tracker["year"] == int(selected_year)].drop_duplicates("period_index") if not tracker.empty else pd.DataFrame()
+    if not tick_df.empty:
+        fig_tracker.update_xaxes(
+            tickmode="array",
+            tickvals=tick_df["period_index"].tolist(),
+            ticktext=tick_df["period"].tolist(),
+            title="Month" if tracker_freq == "Monthly" else "Week",
+        )
     fig_tracker.update_yaxes(title="Cumulative citations")
     fig_tracker.update_layout(legend_title_text="IF year")
     st.plotly_chart(chart_layout(fig_tracker), use_container_width=True)
     st.caption(
-        "Tracker values are OpenAlex-based estimates. The app prorates OpenAlex annual citation buckets across months/weeks; exact month-by-month values would require fetching every individual citing paper and its publication date."
+        "Tracker values are OpenAlex-based estimates. Older comparison years are deliberately faded. The app prorates OpenAlex annual citation buckets across months/weeks; exact month-by-month values would require fetching every individual citing paper and its publication date."
     )
 
     col1, col2 = st.columns([1.15, 1])
