@@ -701,6 +701,123 @@ def cumulative_if_citations(citable: pd.DataFrame, year: int, freq: str = "Month
     return pd.DataFrame(rows)
 
 
+
+def year_to_date_page(snaps: pd.DataFrame) -> None:
+    latest, latest_date = latest_all_works(snaps)
+    current_year = dt.date.today().year
+    years = sorted([int(y) for y in latest["publication_year"].dropna().astype(int).unique()], reverse=True)
+    if not years:
+        years = [current_year]
+    default_index = years.index(current_year) if current_year in years else 0
+
+    page_header(
+        "Year-to-Date Publishing Tracker",
+        "Publication mix, citable-item profile and topic breakdown for ERJ Open Research",
+        "Calendar-year publications; citable status is estimated from OpenAlex/Crossref metadata",
+        latest_date.date().isoformat(),
+    )
+
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    selected_year = col_a.selectbox("Primary year", years, index=default_index)
+    compare_years = col_b.multiselect(
+        "Compare with years",
+        [y for y in years if y != selected_year],
+        default=[y for y in [selected_year - 1, selected_year - 2] if y in years],
+    )
+    all_selected_years = [selected_year] + compare_years
+    st.caption("Use the comparison controls to compare total output, citable/non-citable mix, article types and topics between years.")
+
+    ytd = latest[latest["publication_year"].isin(all_selected_years)].copy()
+    if ytd.empty:
+        st.warning("No publications found for the selected year(s). Use the sidebar to fetch/update OpenAlex data.")
+        return
+    ytd = add_citable_columns(ytd)
+    ytd["publication_month"] = ytd["publication_date"].dt.month
+    ytd["year"] = ytd["publication_year"].astype(int)
+    ytd["citable_status"] = ytd["is_citable"].map({True: "Citable", False: "Non-citable"})
+
+    primary = ytd[ytd["year"] == selected_year].copy()
+    total_published = int(primary["openalex_id"].nunique())
+    citable_count = int(primary.loc[primary["is_citable"], "openalex_id"].nunique())
+    non_citable_count = max(total_published - citable_count, 0)
+    citable_pct = (100 * citable_count / total_published) if total_published else 0
+    top_type = "—" if primary.empty else str(primary["article_type"].fillna("Unknown").value_counts().idxmax())
+    top_topic = "—"
+    if not primary.empty:
+        tmp = explode_themes(primary)
+        if not tmp.empty:
+            vc = tmp["theme_tag"].dropna().value_counts()
+            if not vc.empty:
+                top_topic = str(vc.idxmax())
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric(f"Total published {selected_year}", f"{total_published:,}")
+    c2.metric("Citable items", f"{citable_count:,}", delta=f"{citable_pct:.0f}% of total")
+    c3.metric("Non-citable items", f"{non_citable_count:,}")
+    c4.metric("Most common type", top_type)
+    c5.metric("Top topic/theme", top_topic)
+
+    section_title("Year-on-year publication volume", "Cumulative published items by month for selected years")
+    monthly = ytd.groupby(["year", "publication_month"], as_index=False).agg(papers=("openalex_id", "nunique"))
+    full = []
+    for year in all_selected_years:
+        base = pd.DataFrame({"publication_month": list(range(1, 13))})
+        base["year"] = year
+        merged = base.merge(monthly[monthly["year"] == year], on=["year", "publication_month"], how="left").fillna({"papers": 0})
+        merged["cumulative_papers"] = merged["papers"].cumsum()
+        full.append(merged)
+    cumulative = pd.concat(full, ignore_index=True)
+    cumulative["month_label"] = cumulative["publication_month"].apply(lambda m: dt.date(2000, int(m), 1).strftime("%b"))
+    fig = px.line(cumulative, x="publication_month", y="cumulative_papers", color="year", markers=True, hover_data=["month_label", "papers"])
+    fig.update_xaxes(tickmode="array", tickvals=list(range(1, 13)), ticktext=[dt.date(2000, m, 1).strftime("%b") for m in range(1, 13)], title="Month")
+    fig.update_yaxes(title="Cumulative publications")
+    st.plotly_chart(chart_layout(fig), use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        section_title("Citable vs non-citable", "Estimated denominator status for each selected year")
+        status = ytd.groupby(["year", "citable_status"], as_index=False).agg(papers=("openalex_id", "nunique"))
+        fig = px.bar(status, x="year", y="papers", color="citable_status", barmode="stack", color_discrete_map={"Citable": ERJ_BLUE, "Non-citable": ERJ_RED})
+        fig.update_xaxes(type="category", title="Year")
+        st.plotly_chart(chart_layout(fig), use_container_width=True)
+    with col2:
+        section_title("Article type breakdown", "Original, review, editorial, letter/correspondence and other types")
+        types = ytd.groupby(["year", "article_type"], as_index=False).agg(papers=("openalex_id", "nunique"))
+        fig = px.bar(types, x="year", y="papers", color="article_type", barmode="stack", color_discrete_sequence=PLOTLY_COLORS)
+        fig.update_xaxes(type="category", title="Year")
+        st.plotly_chart(chart_layout(fig), use_container_width=True)
+
+    col3, col4 = st.columns([1.15, 1])
+    with col3:
+        section_title("Topic breakdown", "Papers can have multiple topic/theme tags")
+        themes = explode_themes(ytd)
+        if themes.empty:
+            st.info("No theme tags available yet.")
+        else:
+            theme_counts = themes.groupby(["year", "theme_tag"], as_index=False).agg(papers=("openalex_id", "nunique"))
+            top_theme_names = theme_counts.groupby("theme_tag")["papers"].sum().sort_values(ascending=False).head(16).index.tolist()
+            theme_counts = theme_counts[theme_counts["theme_tag"].isin(top_theme_names)]
+            fig = px.bar(theme_counts, x="papers", y="theme_tag", color="year", orientation="h", barmode="group", color_discrete_sequence=PLOTLY_COLORS)
+            fig.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(chart_layout(fig), use_container_width=True)
+    with col4:
+        section_title("Year summary table")
+        summary = ytd.groupby("year", as_index=False).agg(
+            total_published=("openalex_id", "nunique"),
+            citable_items=("is_citable", "sum"),
+            lifetime_citations=("cited_by_count", "sum"),
+        )
+        summary["non_citable_items"] = summary["total_published"] - summary["citable_items"]
+        summary["citable_%"] = (100 * summary["citable_items"] / summary["total_published"].clip(lower=1)).round(1)
+        st.dataframe(summary.sort_values("year", ascending=False), use_container_width=True, hide_index=True)
+
+    section_title("Publication audit", "All selected-year publications with estimated citable status and reason")
+    audit_cols = ["year", "title", "first_author", "publication_date", "article_type", "is_citable", "citable_reason", "theme", "cited_by_count", "doi", "landing_page_url"]
+    audit = prep_table(ytd[audit_cols].sort_values(["year", "publication_date"], ascending=[False, False]))
+    st.dataframe(audit, use_container_width=True, hide_index=True)
+    st.download_button("Download year-to-date audit CSV", audit.to_csv(index=False), f"erjor_ytd_publication_audit_{selected_year}.csv", "text/csv")
+
+
 def impact_factor_page(snaps: pd.DataFrame) -> None:
     latest, latest_date = latest_all_works(snaps)
     default_year = dt.date.today().year
@@ -878,12 +995,8 @@ with st.sidebar:
     page = st.radio(
         "Navigation",
         [
-            "1. Citation Performance\n12–36 Months",
-            "2. New Papers\n0–12 Months",
-            "3. Topic Momentum",
-            "4. Editorial Intelligence",
-            "5. Estimated Impact Factor",
-            "6. Editorial Board Report",
+            "1. Year to Date",
+            "2. Impact Factor",
         ],
         label_visibility="collapsed",
     )
@@ -892,13 +1005,13 @@ with st.sidebar:
     mailto = st.text_input("OpenAlex mailto", value=DEFAULT_MAILTO)
     auto_refresh = st.checkbox("Auto-fetch if empty / stale", value=True)
     manual_refresh = st.button("Fetch latest data now", type="primary")
-    st.caption("The app fetches ERJOR papers published 0–60 months ago to support citation and estimated Impact Factor windows.")
+    st.caption("The app fetches ERJOR papers published 0–60 months ago to support year-to-date comparisons and estimated Impact Factor windows.")
     st.markdown(
         """
         <div class="sidebar-footer">
           <strong>ERJ OPEN RESEARCH</strong><br/>
-          Editorial citation intelligence using OpenAlex.<br/><br/>
-          <span style="opacity:.9">Citations may differ from Google Scholar.</span>
+          Year-to-date publishing and estimated Impact Factor tracker using OpenAlex.<br/><br/>
+          <span style="opacity:.9">OpenAlex estimates may differ from Web of Science and Google Scholar.</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -919,14 +1032,6 @@ if snaps.empty:
     st.stop()
 
 if page.startswith("1."):
-    citation_performance(snaps)
-elif page.startswith("2."):
-    new_papers(snaps)
-elif page.startswith("3."):
-    topic_momentum(snaps)
-elif page.startswith("4."):
-    editorial_intelligence(snaps)
-elif page.startswith("5."):
-    impact_factor_page(snaps)
+    year_to_date_page(snaps)
 else:
-    report_page(snaps)
+    impact_factor_page(snaps)
