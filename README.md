@@ -33,6 +33,7 @@ A branded Streamlit dashboard for ERJ Open Research citation intelligence using 
    - Previous two-year denominator
    - Excludes editorials, letters, correspondence and research letters where identifiable
    - Citable items audit table
+   - Month-by-month or week-by-week cumulative IF citation tracker comparing the selected year with the previous year
    - What-if calculator
 
 6. **Editorial Board Report**
@@ -93,3 +94,8 @@ Citable ERJOR items published in the previous two years
 ```
 
 The denominator includes articles/research papers and reviews where identifiable. It excludes editorials, letters, research letters, correspondence, corrections, errata, retractions and similar non-citable items where identifiable from OpenAlex/Crossref metadata or title rules. The app includes a citable-items audit table so these decisions are transparent.
+
+
+### Cumulative IF citation tracker
+
+The Impact Factor page includes a tracker showing cumulative citations across Jan-Dec for the selected IF year, with the previous year as a comparison. You can switch between monthly and weekly views. Because the lightweight OpenAlex work record provides `counts_by_year` rather than exact citation dates, the tracker prorates annual citation buckets across the selected periods. It is therefore best treated as a live directional tracker rather than an official Web of Science monthly citation feed.

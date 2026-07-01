@@ -658,6 +658,49 @@ def eif_for_year(df: pd.DataFrame, year: int) -> tuple[pd.DataFrame, pd.DataFram
     return window, citable, numerator, eif
 
 
+
+def cumulative_if_citations(citable: pd.DataFrame, year: int, freq: str = "Monthly", as_of: dt.date | None = None) -> pd.DataFrame:
+    """Build cumulative IF numerator citations through a calendar year.
+
+    Values are estimated from OpenAlex counts_by_year by prorating annual citation
+    buckets across months or ISO-style weeks. This keeps the tracker lightweight
+    for Streamlit Cloud. Exact daily/monthly curves would require fetching every
+    individual citing work and using each citing publication date.
+    """
+    if as_of is None:
+        as_of = dt.date.today()
+    start = dt.date(year, 1, 1)
+    end_exclusive = dt.date(year + 1, 1, 1)
+    if freq == "Weekly":
+        dates = pd.date_range(start, end_exclusive - dt.timedelta(days=1), freq="W-SUN")
+        if len(dates) == 0 or dates[-1].date() < end_exclusive - dt.timedelta(days=1):
+            dates = dates.append(pd.DatetimeIndex([pd.Timestamp(end_exclusive - dt.timedelta(days=1))]))
+        period_label = [f"W{d.isocalendar().week:02d}" for d in dates]
+        x_value = list(range(1, len(dates) + 1))
+    else:
+        dates = pd.date_range(start, end_exclusive - dt.timedelta(days=1), freq="ME")
+        period_label = [d.strftime("%b") for d in dates]
+        x_value = list(range(1, len(dates) + 1))
+
+    rows = []
+    for idx, d in enumerate(dates):
+        end_date = d.date() + dt.timedelta(days=1)
+        if year == as_of.year and d.date() > as_of:
+            # Keep the axis to Dec but do not project future cumulative points as actuals.
+            value = None
+        else:
+            capped_end = min(end_date, as_of + dt.timedelta(days=1)) if year == as_of.year else end_date
+            value = int(citable.apply(lambda r: citation_count_between(r, start, capped_end), axis=1).sum()) if not citable.empty else 0
+        rows.append({
+            "year": year,
+            "period_index": x_value[idx],
+            "period": period_label[idx],
+            "date": d.date().isoformat(),
+            "cumulative_citations": value,
+        })
+    return pd.DataFrame(rows)
+
+
 def impact_factor_page(snaps: pd.DataFrame) -> None:
     latest, latest_date = latest_all_works(snaps)
     default_year = dt.date.today().year
@@ -693,6 +736,39 @@ def impact_factor_page(snaps: pd.DataFrame) -> None:
     c4.metric("Citable items", f"{denominator:,}")
     c5.metric("Excluded items", f"{excluded_count:,}")
     c6.metric("Publication window", f"{selected_year-2}–{selected_year-1}")
+
+    section_title(
+        "Cumulative IF citation tracker",
+        f"Cumulative citations during {selected_year} to citable ERJOR papers published {selected_year-2}–{selected_year-1}, compared with {selected_year-1}."
+    )
+    tracker_freq = st.radio("Tracker granularity", ["Monthly", "Weekly"], horizontal=True, key="if_tracker_frequency")
+    _, previous_citable, _, _ = eif_for_year(latest, int(selected_year) - 1)
+    current_curve = cumulative_if_citations(citable, int(selected_year), tracker_freq)
+    previous_curve = cumulative_if_citations(previous_citable, int(selected_year) - 1, tracker_freq)
+    tracker = pd.concat([current_curve, previous_curve], ignore_index=True)
+    tracker["series"] = tracker["year"].astype(str)
+    fig_tracker = px.line(
+        tracker,
+        x="period_index",
+        y="cumulative_citations",
+        color="series",
+        markers=True,
+        hover_data={"period": True, "date": True, "period_index": False, "series": False},
+        color_discrete_sequence=[ERJ_RED, ERJ_BLUE],
+    )
+    tick_df = tracker[tracker["year"] == int(selected_year)].drop_duplicates("period_index")
+    fig_tracker.update_xaxes(
+        tickmode="array",
+        tickvals=tick_df["period_index"].tolist(),
+        ticktext=tick_df["period"].tolist(),
+        title="Month" if tracker_freq == "Monthly" else "Week",
+    )
+    fig_tracker.update_yaxes(title="Cumulative citations")
+    fig_tracker.update_layout(legend_title_text="IF year")
+    st.plotly_chart(chart_layout(fig_tracker), use_container_width=True)
+    st.caption(
+        "Tracker values are OpenAlex-based estimates. The app prorates OpenAlex annual citation buckets across months/weeks; exact month-by-month values would require fetching every individual citing paper and its publication date."
+    )
 
     col1, col2 = st.columns([1.15, 1])
     with col1:
