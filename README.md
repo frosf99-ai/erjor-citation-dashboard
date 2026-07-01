@@ -28,7 +28,14 @@ A branded Streamlit dashboard for ERJ Open Research citation intelligence using 
    - Hidden gems
    - Commissioning opportunities
 
-5. **Editorial Board Report**
+5. **Estimated Impact Factor**
+   - OpenAlex-based JIF-style estimate
+   - Previous two-year denominator
+   - Excludes editorials, letters, correspondence and research letters where identifiable
+   - Citable items audit table
+   - What-if calculator
+
+6. **Editorial Board Report**
    - One-page summary with CSV export
 
 ## Important citation note
@@ -57,7 +64,7 @@ This package includes:
 .github/workflows/update_data.yml
 ```
 
-The workflow runs daily and commits the refreshed SQLite database back to the repository.
+The workflow runs daily and commits the refreshed SQLite database back to the repository. It fetches a 0-60 month publication window so the Impact Factor page can estimate current and recent two-year denominator windows.
 
 Recommended: add a GitHub repository secret:
 
@@ -73,3 +80,16 @@ OpenAlex recommends including a mailto email address for polite API usage.
 - `fetch_openalex.py` - OpenAlex data fetcher and SQLite updater
 - `requirements.txt` - Python dependencies
 - `.github/workflows/update_data.yml` - optional daily refresh workflow
+
+
+## Estimated Impact Factor method
+
+The estimated Impact Factor is not the official Clarivate Journal Impact Factor. It uses OpenAlex citation data and approximates the standard JIF structure:
+
+```text
+Citations in selected year to ERJOR items published in the previous two years
+/
+Citable ERJOR items published in the previous two years
+```
+
+The denominator includes articles/research papers and reviews where identifiable. It excludes editorials, letters, research letters, correspondence, corrections, errata, retractions and similar non-citable items where identifiable from OpenAlex/Crossref metadata or title rules. The app includes a citable-items audit table so these decisions are transparent.

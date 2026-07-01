@@ -310,7 +310,7 @@ def snapshot_exists_for_today(db_path: Path) -> bool:
         return False
 
 
-def fetch_latest_data(db_path: Path, mailto: str, min_age_months: int = 0, max_age_months: int = 36) -> int:
+def fetch_latest_data(db_path: Path, mailto: str, min_age_months: int = 0, max_age_months: int = 60) -> int:
     connect(str(db_path)).close()
     today = dt.date.today()
     start_date, end_date = publication_window(today, min_age_months, max_age_months)
@@ -474,7 +474,7 @@ def citation_performance(snaps: pd.DataFrame) -> None:
         st.download_button("Download top 25 CSV", prep_table(top25[cols]).to_csv(index=False), "erjor_top25_citations_365d.csv", "text/csv")
     with right:
         section_title("Lifetime citations vs citations in last 365 days")
-        fig = px.scatter(latest, x="cited_by_count", y="citations_365d", hover_name="title", hover_data=["first_author", "article_type"], trendline="ols")
+        fig = px.scatter(latest, x="cited_by_count", y="citations_365d", hover_name="title", hover_data=["first_author", "article_type"], )
         fig.update_traces(marker=dict(color=ERJ_BLUE, size=8, opacity=.78))
         st.plotly_chart(chart_layout(fig), use_container_width=True)
 
@@ -585,6 +585,172 @@ def editorial_intelligence(snaps: pd.DataFrame) -> None:
         st.dataframe(th, use_container_width=True, hide_index=True)
 
 
+
+EXCLUDED_CITABLE_PATTERNS = [
+    "editorial", "letter", "correspondence", "research letter", "reply", "response to",
+    "correction", "erratum", "corrigendum", "retraction", "news", "obituary", "commentary",
+]
+INCLUDED_CITABLE_PATTERNS = [
+    "original research", "research article", "article", "review", "systematic review", "meta-analysis", "meta analysis",
+    "methods", "clinical trial",
+]
+
+
+def citable_decision(row: pd.Series) -> tuple[bool, str]:
+    """Estimate whether a work should be counted in the Impact Factor denominator.
+
+    This is an OpenAlex/Crossref-based approximation of the Web of Science citable-item
+    denominator. It intentionally excludes editorials, letters, correspondence and
+    research letters where the metadata or title suggests those article types.
+    """
+    title = str(row.get("title") or "").strip().lower()
+    article_type = str(row.get("article_type") or "").strip().lower()
+    work_type = str(row.get("work_type") or "").strip().lower()
+    text = f" {title} {article_type} {work_type} "
+
+    for term in EXCLUDED_CITABLE_PATTERNS:
+        if term in text or title.startswith(term + ":") or title.startswith(term + " "):
+            return False, f"Excluded: {term}"
+
+    if "review" in article_type or "review" in work_type or "systematic review" in title or "meta-analysis" in title or "meta analysis" in title:
+        return True, "Included: review"
+    if "original" in article_type or "article" in work_type or "journal-article" in work_type:
+        return True, "Included: article/research"
+
+    for term in INCLUDED_CITABLE_PATTERNS:
+        if term in text:
+            return True, f"Included: {term}"
+    return False, "Excluded: ambiguous/non-citable"
+
+
+def add_citable_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        out["is_citable"] = []
+        out["citable_reason"] = []
+        return out
+    decisions = out.apply(citable_decision, axis=1)
+    out["is_citable"] = decisions.apply(lambda x: x[0])
+    out["citable_reason"] = decisions.apply(lambda x: x[1])
+    return out
+
+
+def latest_all_works(snaps: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp]:
+    latest_date = snaps["snapshot_date"].max()
+    latest = snaps[snaps["snapshot_date"] == latest_date].copy()
+    latest["themes"] = latest.apply(tag_themes, axis=1)
+    latest["theme"] = latest["themes"].apply(lambda x: "; ".join(x))
+    return latest, latest_date
+
+
+def eif_for_year(df: pd.DataFrame, year: int) -> tuple[pd.DataFrame, pd.DataFrame, int, float]:
+    start_pub = pd.Timestamp(year=year-2, month=1, day=1)
+    end_pub = pd.Timestamp(year=year-1, month=12, day=31)
+    window = df[(df["publication_date"] >= start_pub) & (df["publication_date"] <= end_pub)].copy()
+    window = add_citable_columns(window)
+    citable = window[window["is_citable"]].copy()
+    y0 = dt.date(year, 1, 1)
+    y1 = dt.date(year + 1, 1, 1)
+    citable["jif_year_citations"] = citable.apply(lambda r: citation_count_between(r, y0, y1), axis=1)
+    numerator = int(citable["jif_year_citations"].sum()) if not citable.empty else 0
+    denominator = int(citable["openalex_id"].nunique()) if not citable.empty else 0
+    eif = numerator / denominator if denominator else 0.0
+    return window, citable, numerator, eif
+
+
+def impact_factor_page(snaps: pd.DataFrame) -> None:
+    latest, latest_date = latest_all_works(snaps)
+    default_year = dt.date.today().year
+    page_header(
+        "Estimated Impact Factor",
+        "OpenAlex-based live estimate using a Web of Science-style two-year citation window",
+        f"JIF denominator window updates with selected year",
+        latest_date.date().isoformat(),
+    )
+    st.info(
+        "This is an **estimate**, not the official Clarivate Journal Impact Factor. "
+        "The denominator excludes editorials, letters, correspondence, research letters, corrections and similar items where identifiable."
+    )
+
+    available_years = sorted(set(int(y) for y in latest["publication_year"].dropna().astype(int).unique()))
+    min_year = max(min(available_years) + 2, default_year - 4) if available_years else default_year
+    year_options = list(range(min_year, default_year + 1))
+    selected_year = st.selectbox("Impact Factor year", year_options[::-1], index=0)
+
+    window, citable, numerator, eif = eif_for_year(latest, int(selected_year))
+    denominator = int(citable["openalex_id"].nunique()) if not citable.empty else 0
+    excluded_count = int(window[~window.get("is_citable", False)].openalex_id.nunique()) if not window.empty and "is_citable" in window else 0
+    today = dt.date.today()
+    days_elapsed = (today - dt.date(selected_year, 1, 1)).days + 1 if selected_year == today.year else 365
+    days_in_year = 366 if dt.date(selected_year, 12, 31).timetuple().tm_yday == 366 else 365
+    projected_numerator = int(round(numerator * days_in_year / max(days_elapsed, 1))) if selected_year == today.year else numerator
+    projected_eif = projected_numerator / denominator if denominator else 0.0
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Estimated IF", f"{eif:.2f}")
+    c2.metric("Projected year-end IF", f"{projected_eif:.2f}")
+    c3.metric("Citations in IF year", f"{numerator:,}")
+    c4.metric("Citable items", f"{denominator:,}")
+    c5.metric("Excluded items", f"{excluded_count:,}")
+    c6.metric("Publication window", f"{selected_year-2}–{selected_year-1}")
+
+    col1, col2 = st.columns([1.15, 1])
+    with col1:
+        section_title("Estimated IF by year", "OpenAlex-based annual estimates where data are available")
+        rows = []
+        for y in year_options:
+            w, c, n, val = eif_for_year(latest, y)
+            rows.append({
+                "year": y,
+                "estimated_if": round(val, 3),
+                "citations_to_previous_2y": n,
+                "citable_items": int(c["openalex_id"].nunique()) if not c.empty else 0,
+                "publication_window": f"{y-2}-{y-1}",
+            })
+        hist = pd.DataFrame(rows)
+        fig = px.line(hist, x="year", y="estimated_if", markers=True, hover_data=["citations_to_previous_2y", "citable_items", "publication_window"])
+        fig.update_traces(line_color=ERJ_RED)
+        st.plotly_chart(chart_layout(fig), use_container_width=True)
+        st.dataframe(hist.sort_values("year", ascending=False), use_container_width=True, hide_index=True)
+    with col2:
+        section_title("Numerator contributors", "Papers driving the estimated Impact Factor")
+        if citable.empty:
+            st.warning("No citable items found for this denominator window.")
+        else:
+            top = citable.sort_values("jif_year_citations", ascending=False).head(15)
+            fig = px.bar(top, x="jif_year_citations", y="title", orientation="h", hover_data=["first_author", "article_type", "publication_date"])
+            fig.update_traces(marker_color=ERJ_BLUE)
+            fig.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(chart_layout(fig), use_container_width=True)
+
+    section_title("Citable items audit", "Review inclusion/exclusion decisions for the denominator")
+    if window.empty:
+        st.warning("No works found in the selected two-year publication window. Fetching a wider OpenAlex window may be needed.")
+    else:
+        audit = window.copy()
+        if "jif_year_citations" not in audit:
+            audit["jif_year_citations"] = audit.apply(lambda r: citation_count_between(r, dt.date(selected_year, 1, 1), dt.date(selected_year + 1, 1, 1)), axis=1)
+        audit = prep_table(audit[[
+            "title", "first_author", "publication_date", "article_type", "work_type",
+            "is_citable", "citable_reason", "jif_year_citations", "cited_by_count", "doi", "landing_page_url"
+        ]].sort_values(["is_citable", "jif_year_citations"], ascending=[False, False]))
+        st.dataframe(audit, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download citable items audit CSV",
+            audit.to_csv(index=False),
+            f"erjor_estimated_if_{selected_year}_audit.csv",
+            "text/csv",
+        )
+
+    section_title("What-if calculator")
+    wc1, wc2, wc3 = st.columns(3)
+    extra_citations = wc1.number_input("Extra citations in IF year", min_value=0, value=0, step=1)
+    add_items = wc2.number_input("Additional citable items", min_value=0, value=0, step=1)
+    remove_items = wc3.number_input("Citable items to exclude", min_value=0, value=0, step=1)
+    adjusted_denominator = max(denominator + int(add_items) - int(remove_items), 1)
+    adjusted_eif = (numerator + int(extra_citations)) / adjusted_denominator
+    st.metric("Adjusted estimated IF", f"{adjusted_eif:.2f}", delta=f"{adjusted_eif - eif:+.2f} vs current estimate")
+
 def report_page(snaps: pd.DataFrame) -> None:
     latest, _, latest_date, cohort = enrich_latest(snaps, 12, 36)
     page_header("Editorial Board Report", "One-page exportable summary", cohort, latest_date.date().isoformat())
@@ -618,7 +784,8 @@ with st.sidebar:
             "2. New Papers\n0–12 Months",
             "3. Topic Momentum",
             "4. Editorial Intelligence",
-            "5. Editorial Board Report",
+            "5. Estimated Impact Factor",
+            "6. Editorial Board Report",
         ],
         label_visibility="collapsed",
     )
@@ -627,7 +794,7 @@ with st.sidebar:
     mailto = st.text_input("OpenAlex mailto", value=DEFAULT_MAILTO)
     auto_refresh = st.checkbox("Auto-fetch if empty / stale", value=True)
     manual_refresh = st.button("Fetch latest data now", type="primary")
-    st.caption("The app fetches ERJOR papers published 0–36 months ago.")
+    st.caption("The app fetches ERJOR papers published 0–60 months ago to support citation and estimated Impact Factor windows.")
     st.markdown(
         """
         <div class="sidebar-footer">
@@ -661,5 +828,7 @@ elif page.startswith("3."):
     topic_momentum(snaps)
 elif page.startswith("4."):
     editorial_intelligence(snaps)
+elif page.startswith("5."):
+    impact_factor_page(snaps)
 else:
     report_page(snaps)
