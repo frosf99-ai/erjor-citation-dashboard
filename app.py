@@ -72,151 +72,126 @@ def inject_css() -> None:
         f"""
         <style>
         :root {{
-            --erj-blue: {ERJ_BLUE};
-            --erj-dark-blue: {ERJ_DARK_BLUE};
-            --erj-red: {ERJ_RED};
-            --erj-light: {ERJ_LIGHT};
+            --ers-navy: #002b5c;
+            --ers-blue: #004b93;
+            --ers-mid-blue: #0067b1;
+            --ers-red: #e30613;
+            --ers-teal: #008c95;
+            --ers-light: #f5f8fc;
+            --ers-border: #d8dee9;
+            --ers-text: #101828;
         }}
-        .stApp {{ background: #ffffff; }}
+        .stApp {{
+            background: radial-gradient(circle at top right, rgba(0,75,147,.08), transparent 30%), #ffffff;
+        }}
+        .block-container {{ padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1600px; }}
         section[data-testid="stSidebar"] {{
-            background: linear-gradient(180deg, #003B71 0%, #004B93 48%, #002B52 100%);
+            background:
+              radial-gradient(circle at 15% 96%, rgba(255,255,255,.12) 0 2px, transparent 2px) 0 0/18px 18px,
+              linear-gradient(180deg, #003b71 0%, #004b93 45%, #002b5c 100%);
+            box-shadow: 8px 0 30px rgba(0,43,92,.14);
         }}
         section[data-testid="stSidebar"] * {{ color: white !important; }}
-        section[data-testid="stSidebar"] .stRadio label {{
-            padding: 0.35rem 0.2rem;
+        section[data-testid="stSidebar"] .stRadio > label {{ display:none; }}
+        section[data-testid="stSidebar"] div[role="radiogroup"] label {{
+            padding: .85rem .8rem;
             border-radius: 12px;
+            margin: .18rem 0;
+            border: 1px solid rgba(255,255,255,.08);
         }}
-        div[data-testid="stMetric"] {{
-            background: #fff;
-            border: 1px solid #D8DEE9;
-            border-radius: 14px;
-            padding: 18px 18px 14px 18px;
-            box-shadow: 0 2px 10px rgba(16, 24, 40, 0.04);
-            min-height: 132px;
+        section[data-testid="stSidebar"] div[role="radiogroup"] label:hover {{
+            background: rgba(255,255,255,.10);
         }}
-        div[data-testid="stMetricLabel"] p {{
-            color: {ERJ_BLUE} !important;
-            font-weight: 800 !important;
-            text-transform: uppercase;
-            font-size: 0.78rem !important;
-            letter-spacing: .02em;
+        .ers-sidebar-brand {{ padding: 18px 8px 24px 0; }}
+        .ers-logo-row {{ display:flex; gap:14px; align-items:flex-start; }}
+        .ers-mark {{
+            width:64px; height:64px; border-radius:50%;
+            background: var(--ers-red);
+            box-shadow: 0 8px 24px rgba(0,0,0,.22);
+            position:relative; flex: 0 0 64px;
         }}
-        div[data-testid="stMetricValue"] {{
-            color: #101828;
-            font-weight: 900;
+        .ers-mark:before {{
+            content:""; position:absolute; inset:13px;
+            background:
+              radial-gradient(circle, #fff 0 2px, transparent 2.5px) 0 0/9px 9px;
+            opacity:.95; border-radius:50%;
         }}
-        .block-container {{ padding-top: 1.4rem; padding-bottom: 2rem; }}
-        .erj-header {{
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 24px;
-            margin-bottom: 1.0rem;
-        }}
-        .erj-title h1 {{
-            color: #101828;
-            font-size: 2.25rem;
-            font-weight: 900;
-            margin: 0;
-            line-height: 1.1;
-        }}
-        .erj-title p {{
-            color: #53637A;
-            font-size: 1.15rem;
-            margin: 0.45rem 0 0 0;
-        }}
-        .erj-brand {{
-            min-width: 280px;
-            text-align: left;
-            border-left: 1px solid #D8DEE9;
-            padding-left: 24px;
-            color: {ERJ_BLUE};
-            font-weight: 800;
-            letter-spacing: .02em;
-            line-height: 1.15;
-        }}
-        .erj-brand .open {{ color: {ERJ_RED}; margin-top: 6px; }}
-        .erj-subnote {{
-            color: #53637A;
-            font-size: 0.9rem;
-            margin: .4rem 0 1.2rem 0;
-        }}
-        .section-card {{
-            background: #fff;
-            border: 1px solid #D8DEE9;
-            border-radius: 14px;
-            padding: 16px 18px;
-            box-shadow: 0 2px 10px rgba(16, 24, 40, 0.04);
-            margin-bottom: 14px;
-        }}
-        .section-card h3 {{
-            color: {ERJ_BLUE};
-            text-transform: uppercase;
-            font-size: 0.9rem;
-            letter-spacing: .02em;
-            margin-top: 0;
-        }}
-        .sidebar-logo {{
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin: 0 0 24px 0;
-            padding: 16px 8px 12px 4px;
-        }}
-        .logo-dot {{
-            width: 54px;
-            height: 54px;
-            border-radius: 50%;
-            background: {ERJ_RED};
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: 900;
-            font-size: 1.15rem;
-            box-shadow: 0 5px 18px rgba(0,0,0,.18);
-        }}
-        .logo-text {{ line-height: 1.05; }}
-        .logo-text .erj {{ font-size: 2.2rem; font-weight: 900; letter-spacing: .02em; }}
-        .logo-text .or {{ font-size: .95rem; font-weight: 800; }}
+        .ers-wordmark .ers {{ font-size:2.35rem; font-weight:900; letter-spacing:.02em; line-height:.86; }}
+        .ers-wordmark .society {{ font-size:.78rem; font-weight:800; line-height:1.15; margin-top:6px; letter-spacing:.04em; }}
+        .journal-lockup {{ margin-top:26px; }}
+        .journal-lockup .journal-title {{ font-size:1.15rem; font-weight:900; letter-spacing:.01em; }}
+        .journal-lockup .journal-sub {{ margin-top:7px; font-size:.84rem; line-height:1.4; opacity:.96; }}
         .sidebar-footer {{
-            margin-top: 36px;
-            padding-top: 20px;
-            border-top: 1px solid rgba(255,255,255,.35);
-            font-size: 0.85rem;
-            line-height: 1.45;
-            opacity: .95;
+            margin-top:32px; padding-top:20px; border-top:1px solid rgba(255,255,255,.35);
+            font-size:.82rem; line-height:1.45; opacity:.95;
         }}
-        .pill {{
-            display: inline-block;
-            background: #EEF4FF;
-            color: {ERJ_BLUE};
-            border: 1px solid #C7D7FE;
-            border-radius: 999px;
-            padding: 3px 10px;
-            margin: 2px 4px 2px 0;
-            font-size: 0.78rem;
-            font-weight: 700;
+        .ers-topbar {{
+            display:flex; justify-content:space-between; align-items:flex-start; gap:24px;
+            border-bottom:1px solid #e4e9f2; padding-bottom:14px; margin-bottom:18px;
         }}
-        div[data-testid="stDataFrame"] {{ border: 1px solid #D8DEE9; border-radius: 12px; }}
-        button[kind="primary"] {{ background: {ERJ_BLUE} !important; }}
+        .ers-product {{ font-size:1.45rem; font-weight:900; letter-spacing:.04em; color:var(--ers-blue); }}
+        .ers-product span {{ color:var(--ers-red); }}
+        .ers-right-lockup {{
+            color:var(--ers-blue); font-weight:850; letter-spacing:.03em; line-height:1.15; text-align:left;
+            display:flex; align-items:flex-start; gap:22px;
+        }}
+        .ers-right-lockup .open {{ color:var(--ers-red); margin-top:6px; }}
+        .ers-lungs {{ width:76px; height:54px; position:relative; margin-top:2px; }}
+        .ers-lungs:before, .ers-lungs:after {{ content:""; position:absolute; width:28px; height:48px; border-radius: 60% 60% 45% 45%; top:2px; }}
+        .ers-lungs:before {{ left:5px; border-left:8px dotted var(--ers-blue); border-top:8px dotted var(--ers-blue); transform:rotate(16deg); }}
+        .ers-lungs:after {{ right:5px; border-right:8px dotted var(--ers-red); border-top:8px dotted var(--ers-red); transform:rotate(-16deg); }}
+        .erj-header {{ margin-bottom: 1rem; }}
+        .erj-title h1 {{ color: var(--ers-navy); font-size:2.05rem; font-weight:900; margin:0; line-height:1.1; }}
+        .erj-title p {{ color:#455a7a; font-size:1.1rem; margin:.45rem 0 0 0; }}
+        .erj-subnote {{ color:#53637a; font-size:.88rem; margin:.8rem 0 0 0; }}
+        div[data-testid="stMetric"] {{
+            background:#fff; border:1px solid var(--ers-border); border-radius:14px;
+            padding:18px 18px 14px 18px; box-shadow:0 2px 14px rgba(16,24,40,.045);
+            min-height:142px; position:relative; overflow:hidden;
+        }}
+        div[data-testid="stMetric"]:before {{
+            content:""; position:absolute; left:0; top:0; bottom:0; width:5px; background:var(--ers-blue);
+        }}
+        div[data-testid="stMetric"]:nth-of-type(3):before {{ background:var(--ers-red); }}
+        div[data-testid="stMetricLabel"] p {{
+            color: var(--ers-blue) !important; font-weight:900 !important; text-transform:uppercase;
+            font-size:.75rem !important; letter-spacing:.02em;
+        }}
+        div[data-testid="stMetricValue"] {{ color:var(--ers-text); font-weight:900; }}
+        div[data-testid="stMetricDelta"] {{ color:var(--ers-red) !important; }}
+        .section-card {{
+            background:#fff; border:1px solid var(--ers-border); border-radius:14px;
+            padding:16px 18px; box-shadow:0 2px 14px rgba(16,24,40,.045); margin-bottom:14px;
+        }}
+        .section-card h3, h3 {{ color:var(--ers-blue) !important; text-transform:uppercase; font-size:.9rem !important; letter-spacing:.02em; }}
+        .pill {{ display:inline-block; background:#eef4ff; color:var(--ers-blue); border:1px solid #c7d7fe; border-radius:999px; padding:3px 10px; margin:2px 4px 2px 0; font-size:.78rem; font-weight:700; }}
+        div[data-testid="stDataFrame"] {{ border:1px solid var(--ers-border); border-radius:12px; }}
+        .stDownloadButton button, button[kind="primary"] {{ background:var(--ers-blue) !important; color:white !important; border:0 !important; }}
+        .stButton button {{ border-radius:10px; }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-
 def sidebar_logo() -> None:
     st.sidebar.markdown(
         """
-        <div class="sidebar-logo">
-          <div class="logo-dot">ERJ</div>
-          <div class="logo-text"><div class="erj">ERJ</div><div class="or">OPEN RESEARCH</div></div>
+        <div class="ers-sidebar-brand">
+          <div class="ers-logo-row">
+            <div class="ers-mark"></div>
+            <div class="ers-wordmark">
+              <div class="ers">ERS</div>
+              <div class="society">EUROPEAN<br/>RESPIRATORY<br/>SOCIETY</div>
+            </div>
+          </div>
+          <div class="journal-lockup">
+            <div class="journal-title">ERJ OPEN RESEARCH</div>
+            <div class="journal-sub">Advancing open respiratory<br/>science for better health</div>
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
 
 def page_header(title: str, subtitle: str, cohort: str | None = None, updated: str | None = None) -> None:
     details = []
@@ -227,21 +202,23 @@ def page_header(title: str, subtitle: str, cohort: str | None = None, updated: s
     details_text = " &nbsp; | &nbsp; ".join(details)
     st.markdown(
         f"""
+        <div class="ers-topbar">
+          <div class="ers-product">ERJ <span>OPEN RESEARCH</span></div>
+          <div class="ers-right-lockup">
+            <div>EUROPEAN RESPIRATORY<br/>JOURNAL<div class="open">OPEN RESEARCH</div></div>
+            <div class="ers-lungs"></div>
+          </div>
+        </div>
         <div class="erj-header">
           <div class="erj-title">
             <h1>{title}</h1>
             <p>{subtitle}</p>
             <div class="erj-subnote">ⓘ {details_text}</div>
           </div>
-          <div class="erj-brand">
-            EUROPEAN RESPIRATORY<br/>JOURNAL
-            <div class="open">OPEN RESEARCH</div>
-          </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
 
 def section_title(title: str, caption: str | None = None) -> None:
     cap = f"<div style='color:{ERJ_GREY}; font-size:.9rem; margin-top:-.35rem'>{caption}</div>" if caption else ""
