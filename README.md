@@ -1,65 +1,75 @@
 # ERJOR Editorial Intelligence Dashboard
 
-A free Streamlit dashboard for ERJ Open Research using OpenAlex data.
+A branded Streamlit dashboard for ERJ Open Research citation intelligence using OpenAlex.
 
 ## What it shows
 
-### 1. Citation performance: 12-36 months
-- Total papers published 12-36 months ago
-- Estimated citations accrued in the first 12 months after publication
-- Current total citations
-- Median first-year citations
-- Proportion with >=10 estimated first-year citations
-- Citation trend for the cohort
+1. **Citation Performance (12-36 month cohort)**
+   - Papers published 12-36 months ago
+   - Lifetime citations
+   - Estimated citations in the last 365 days
+   - Mean/median recent citations
+   - Top 25 papers by recent citations
+   - Theme and article type performance
 
-Important: OpenAlex does not provide exact month-level historical citing dates in the free Works endpoint. The app estimates first-12-month citations from OpenAlex `counts_by_year` annual buckets. It also stores daily snapshots from the day the app starts running, which improves future trend analysis.
+2. **New Papers (0-12 months)**
+   - Article type breakdown
+   - Multi-theme breakdown
+   - Clinical research / basic science / translational tags
+   - Papers already gaining citation traction
 
-### 2. New papers: 0-12 months
-- Total papers published in the last 12 months
-- Article type breakdown: review, original research, editorial, correspondence, etc.
-- Multi-theme breakdown
-- Papers already being cited regularly
-- Citations/month
+3. **Topic Momentum**
+   - Themes ranked by recent citation momentum
+   - Bubble chart and top paper per theme
 
-### 3. Top 25 papers
-- Title
-- First author
-- Theme/topic tags
-- Citation count
-- Estimated first-12-month citations
-- Date/year of publication
-- Article type
-- DOI/link
+4. **Editorial Intelligence**
+   - Rising stars
+   - High-potential new papers
+   - Hidden gems
+   - Commissioning opportunities
 
-### 4. Topic momentum
-- Themes ranked by citation momentum
-- Papers per theme
-- Total citations
-- 30/90-day gains when daily snapshots are available
-- Citations per paper
-- Top paper in each theme
+5. **Editorial Board Report**
+   - One-page summary with CSV export
 
-## Theme tagging
+## Important citation note
 
-Themes are non-exclusive. A paper can have more than one tag.
+OpenAlex `cited_by_count` is a lifetime citation total. The dashboard estimates **citations in the last 365 days** from OpenAlex `counts_by_year` by prorating annual citation buckets. This is suitable for editorial monitoring, but exact day-level recent citation counts would require fetching every citing work and checking its publication date.
 
-Disease/content themes include bronchiectasis, COPD, asthma, ILD, pulmonary vascular disease, respiratory infection, lung cancer, sleep medicine, pulmonary rehabilitation, critical care, respiratory physiology, imaging, digital health, airway disease, environmental/occupational lung disease, and rare lung disease.
-
-Research type tags include clinical research, basic science, translational research, epidemiology, health services research, clinical trials, systematic review/meta-analysis, artificial intelligence, and implementation science.
-
-The current classifier uses title, OpenAlex concepts/topics/keywords, and article metadata. It is deliberately transparent and editable in `app.py`.
+Google Scholar counts are often higher than OpenAlex because Google Scholar indexes a broader range of sources and does not provide a public API.
 
 ## Deploy on Streamlit Community Cloud
 
-1. Upload these files to your GitHub repository:
-   - `app.py`
-   - `fetch_openalex.py`
-   - `requirements.txt`
-2. In Streamlit Community Cloud, deploy with:
-   - Main file path: `app.py`
-   - Branch: usually `main`
-3. Open the app and click **Fetch latest data now** in the sidebar.
+1. Upload these files to your GitHub repository.
+2. On Streamlit Community Cloud, deploy the app.
+3. Set the main file path to:
 
-## Notes on citation counts
+```text
+app.py
+```
 
-OpenAlex and Google Scholar use different indexing methods, so counts will not always match. Google Scholar is usually broader and often higher. This app should be treated as an OpenAlex-based editorial intelligence tool, not a replacement for Google Scholar or Scopus.
+4. Open the app and click **Fetch latest data now** in the sidebar.
+
+## Optional daily refresh with GitHub Actions
+
+This package includes:
+
+```text
+.github/workflows/update_data.yml
+```
+
+The workflow runs daily and commits the refreshed SQLite database back to the repository.
+
+Recommended: add a GitHub repository secret:
+
+```text
+OPENALEX_MAILTO=your.email@example.com
+```
+
+OpenAlex recommends including a mailto email address for polite API usage.
+
+## Files
+
+- `app.py` - Streamlit dashboard
+- `fetch_openalex.py` - OpenAlex data fetcher and SQLite updater
+- `requirements.txt` - Python dependencies
+- `.github/workflows/update_data.yml` - optional daily refresh workflow

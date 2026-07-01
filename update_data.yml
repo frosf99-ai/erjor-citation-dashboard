@@ -1,0 +1,31 @@
+name: Refresh OpenAlex citation data
+
+on:
+  schedule:
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Fetch ERJOR OpenAlex data
+        env:
+          OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+        run: python fetch_openalex.py --db erjor_citations.sqlite --mailto "${OPENALEX_MAILTO:-freddy.frost@lhch.nhs.uk}" --min-age-months 0 --max-age-months 36
+      - name: Commit refreshed database
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add erjor_citations.sqlite erjor_citations.sqlite-wal erjor_citations.sqlite-shm || true
+          git commit -m "Refresh OpenAlex citation data" || echo "No changes to commit"
+          git push
