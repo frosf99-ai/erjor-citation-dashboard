@@ -1,29 +1,56 @@
-# ERJ Open Research Impact Factor Tracker
+# ERJOR YTD + Impact Factor + Decision Tracker
 
-A simplified Streamlit dashboard focused on two pages:
+Streamlit dashboard for ERJ Open Research editorial monitoring.
+
+## Pages
 
 1. **Year to Date**
-   - Total published in the selected year
-   - Citable vs non-citable breakdown
-   - Article type breakdown, e.g. original research, review, editorial, correspondence/letter
-   - Topic/theme breakdown
-   - Year-on-year comparison controls
-   - Publication audit table with estimated citable status and reason
+   - Total publications
+   - Citable / non-citable split
+   - Article type breakdown
+   - Topic breakdown
+   - Year comparison
 
 2. **Impact Factor**
    - OpenAlex-estimated Impact Factor
-   - Citable-item denominator audit
-   - Cumulative IF citation tracker by month or week
-   - Current year compared with previous years using faded reference lines
+   - Numerator / denominator
+   - Cumulative IF-year citation tracker
+   - Citable item audit
    - What-if calculator
 
-## Important note
+3. **Decision Tracker**
+   - Paste ScholarOne decision text directly into the app
+   - Upload the existing ERJOR decisions `.ods`, `.csv` or `.xlsx`
+   - Accepts/rejects per month
+   - Study-type breakdown
+   - Topic breakdown
+   - Month-by-month tracker
+   - Median time to decision
+   - Downloadable decision records CSV
 
-This is an **OpenAlex-based estimate**, not the official Clarivate/Web of Science Journal Impact Factor. The denominator attempts to exclude editorials, letters, correspondence, research letters, corrections and similar non-citable items where the metadata or title indicates this.
+## Decision tracker notes
 
-## Deploy on Streamlit Community Cloud
+The Decision Tracker is designed to replicate the current Google Sheets workflow. It parses text blocks like:
 
-Upload these files to your GitHub repository:
+```text
+ERJOR-00118-2026 Submitted: 23-Jan-2026; Last Updated: 23-Jan-2026; In Review: 0sec ... Original Research Article Desk Reject
+```
+
+It extracts:
+
+- manuscript ID
+- submitted date
+- decision date, using `Last Updated`
+- study type
+- decision
+- simple topic tags
+- estimated days to decision
+
+On Streamlit Community Cloud, local files are not guaranteed to persist after redeploy/sleep. Use the **Download decision records CSV** button as the backup/export, then re-upload it when needed.
+
+## Deploy
+
+Upload/replace these files in your GitHub repository:
 
 - `app.py`
 - `fetch_openalex.py`
@@ -31,13 +58,4 @@ Upload these files to your GitHub repository:
 - `.github/workflows/update_data.yml`
 - `README.md`
 
-Then redeploy the Streamlit app with:
-
-- Main file path: `app.py`
-- Branch: `main`
-
-## Data refresh
-
-The app can fetch data from OpenAlex in the sidebar. The included GitHub Actions workflow can also refresh data daily.
-
-OpenAlex recommends supplying an email address with API requests. The app uses `OPENALEX_MAILTO` if set, otherwise the sidebar value.
+Then Streamlit should redeploy automatically.

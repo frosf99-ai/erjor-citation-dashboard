@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 import os
 import re
@@ -988,6 +989,284 @@ def report_page(snaps: pd.DataFrame) -> None:
     st.caption("Use your browser's print command to save this page as PDF for now. A dedicated PDF export can be added later.")
 
 
+# -----------------------------
+# Decision tracker helpers
+# -----------------------------
+DECISION_FILE = Path("decision_records.csv")
+
+DECISION_TYPE_PATTERNS = [
+    "Original Research Article", "Research Letter", "Systematic Review", "Review", "Protocol",
+    "Correspondence", "Editorial", "Letter", "Perspective", "Commentary", "Case Report"
+]
+
+def parse_scholarone_date(value: str | None) -> pd.Timestamp:
+    if not value:
+        return pd.NaT
+    return pd.to_datetime(value, errors="coerce", dayfirst=True)
+
+def detect_decision(raw: str) -> str:
+    txt = raw.lower()
+    if "desk reject" in txt:
+        return "Desk Reject"
+    if re.search(r"\breject(?:ed)?\b", txt):
+        return "Reject"
+    if re.search(r"\baccept(?:ed)?\b", txt):
+        return "Accept"
+    if "revise" in txt or "revision" in txt:
+        return "Revision"
+    return "Other"
+
+def detect_study_type(raw: str) -> str:
+    lower = raw.lower()
+    aliases = {
+        "original research article": "Original Research Article",
+        "research letter": "Research Letter",
+        "systematic review": "Systematic Review",
+        "meta-analysis": "Review",
+        "meta analysis": "Review",
+        "review": "Review",
+        "protocol": "Protocol",
+        "correspondence": "Correspondence",
+        "editorial": "Editorial",
+        "letter": "Letter",
+        "perspective": "Perspective",
+        "commentary": "Commentary",
+        "case report": "Case Report",
+    }
+    for key, label in aliases.items():
+        if key in lower:
+            return label
+    return "Unclassified"
+
+def extract_title_from_raw(raw: str, study_type: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw)).strip()
+    m = re.search(r"In Review:\s*[^A-Z]*(.*)", text)
+    body = m.group(1).strip() if m else text
+    if study_type and study_type != "Unclassified":
+        idx = body.lower().find(study_type.lower())
+        if idx > 0:
+            body = body[:idx].strip()
+    # Remove author tail heuristically: title is before the first "Surname, Firstname" pattern after at least a few words.
+    auth = re.search(r"\s+[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'\-]+,\s+[A-ZÀ-ÖØ-Þ]", body)
+    if auth and auth.start() > 20:
+        body = body[:auth.start()].strip()
+    return body[:240]
+
+def parse_decision_text(text: str) -> dict:
+    raw = re.sub(r"\s+", " ", str(text)).strip()
+    mid = re.search(r"\b(ERJOR-\d{5}-\d{4}(?:\.R\d+)?)\b", raw)
+    submitted = re.search(r"Submitted:\s*([^;]+)", raw)
+    updated = re.search(r"Last Updated:\s*([^;]+)", raw)
+    study_type = detect_study_type(raw)
+    submitted_date = parse_scholarone_date(submitted.group(1).strip() if submitted else None)
+    decision_date = parse_scholarone_date(updated.group(1).strip() if updated else None)
+    decision = detect_decision(raw)
+    title = extract_title_from_raw(raw, study_type)
+    themes = assign_themes(title + " " + raw)
+    days_to_decision = None
+    if pd.notna(submitted_date) and pd.notna(decision_date):
+        days_to_decision = max(int((decision_date.date() - submitted_date.date()).days), 0)
+    return {
+        "manuscript_id": mid.group(1) if mid else "",
+        "title": title,
+        "submitted_date": submitted_date.date().isoformat() if pd.notna(submitted_date) else "",
+        "decision_date": decision_date.date().isoformat() if pd.notna(decision_date) else "",
+        "study_type": study_type,
+        "decision": decision,
+        "themes": "; ".join(themes),
+        "days_to_decision": days_to_decision,
+        "raw_text": raw,
+    }
+
+def split_pasted_decisions(text: str) -> list[str]:
+    text = str(text or "").strip()
+    if not text:
+        return []
+    # Split before manuscript IDs while retaining each ID.
+    parts = re.split(r"(?=\bERJOR-\d{5}-\d{4})", text)
+    return [p.strip() for p in parts if p.strip() and re.search(r"\bERJOR-\d{5}-\d{4}", p)]
+
+def parse_decision_blocks(blocks: Iterable[str]) -> pd.DataFrame:
+    records = [parse_decision_text(b) for b in blocks if str(b).strip()]
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+    df["decision_date"] = pd.to_datetime(df["decision_date"], errors="coerce")
+    df["submitted_date"] = pd.to_datetime(df["submitted_date"], errors="coerce")
+    df["days_to_decision"] = pd.to_numeric(df["days_to_decision"], errors="coerce")
+    df = df.drop_duplicates(subset=["manuscript_id", "decision", "decision_date"], keep="last")
+    return df
+
+def parse_uploaded_decision_file(uploaded) -> pd.DataFrame:
+    if uploaded is None:
+        return pd.DataFrame()
+    name = uploaded.name.lower()
+    try:
+        if name.endswith(".ods"):
+            raw = pd.read_excel(uploaded, sheet_name="Inputs", engine="odf", header=None, usecols=[0], nrows=2500)
+            blocks = raw.iloc[:, 0].dropna().astype(str).tolist()
+            blocks = [b for b in blocks if re.search(r"\bERJOR-\d{5}-\d{4}", b)]
+            return parse_decision_blocks(blocks)
+        if name.endswith(".csv"):
+            df = pd.read_csv(uploaded)
+        else:
+            df = pd.read_excel(uploaded)
+        # If this is an exported tracker CSV, standardise dates and return.
+        if "raw_text" in df.columns or "manuscript_id" in df.columns:
+            for col in ["decision_date", "submitted_date"]:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+            if "days_to_decision" in df.columns:
+                df["days_to_decision"] = pd.to_numeric(df["days_to_decision"], errors="coerce")
+            return df
+    except Exception as exc:
+        st.error(f"Could not parse uploaded decision file: {exc}")
+    return pd.DataFrame()
+
+def normalise_decision_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    for col in ["manuscript_id", "title", "study_type", "decision", "themes", "raw_text"]:
+        if col not in out.columns:
+            out[col] = ""
+    for col in ["decision_date", "submitted_date"]:
+        out[col] = pd.to_datetime(out[col], errors="coerce")
+    out["days_to_decision"] = pd.to_numeric(out.get("days_to_decision"), errors="coerce")
+    out["decision_month"] = out["decision_date"].dt.to_period("M").astype(str)
+    out["decision_year"] = out["decision_date"].dt.year
+    out["month_name"] = out["decision_date"].dt.strftime("%b")
+    out["month_num"] = out["decision_date"].dt.month
+    out["decision_group"] = out["decision"].replace({"Desk Reject": "Reject"})
+    out.loc[out["decision_group"].isin(["Accept", "Reject"]) == False, "decision_group"] = "Other"
+    return out.drop_duplicates(subset=["manuscript_id", "decision", "decision_date"], keep="last")
+
+def decision_tracker_page() -> None:
+    page_header(
+        "Decision Tracker",
+        "Paste ScholarOne decision text and monitor accept/reject activity in real time",
+        "Editorial decisions by month, study type and topic",
+        TODAY.isoformat(),
+    )
+    st.info("Paste one or more ScholarOne decision text blocks below, or upload your existing ODS/CSV tracker. On Streamlit Cloud, use the CSV download as your backup because local app storage may reset after redeploys.")
+
+    if "decision_records" not in st.session_state:
+        st.session_state["decision_records"] = pd.DataFrame()
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        uploaded = st.file_uploader("Upload existing ERJOR decisions ODS/CSV", type=["ods", "csv", "xlsx"])
+        if uploaded is not None and st.button("Load uploaded decisions"):
+            df_upload = parse_uploaded_decision_file(uploaded)
+            st.session_state["decision_records"] = normalise_decision_df(pd.concat([st.session_state["decision_records"], df_upload], ignore_index=True))
+            st.success(f"Loaded {len(df_upload):,} decision records from upload.")
+    with c2:
+        pasted = st.text_area("Paste new decision text", height=180, placeholder="ERJOR-00118-2026 Submitted: 23-Jan-2026; Last Updated: 23-Jan-2026; In Review: 0sec ... Original Research Article Desk Reject")
+        add_cols = st.columns([1, 1])
+        if add_cols[0].button("Add pasted decisions", type="primary"):
+            blocks = split_pasted_decisions(pasted)
+            df_new = parse_decision_blocks(blocks)
+            st.session_state["decision_records"] = normalise_decision_df(pd.concat([st.session_state["decision_records"], df_new], ignore_index=True))
+            st.success(f"Added {len(df_new):,} parsed decision records.")
+        if add_cols[1].button("Clear session decisions"):
+            st.session_state["decision_records"] = pd.DataFrame()
+            st.warning("Session decision records cleared.")
+
+    df = normalise_decision_df(st.session_state["decision_records"])
+    if df.empty:
+        st.warning("No decision records loaded yet. Upload the ODS tracker or paste a decision block to begin.")
+        return
+
+    years = sorted([int(y) for y in df["decision_year"].dropna().unique()], reverse=True)
+    selected_years = st.multiselect("Years to show", years, default=years[:1] if years else [])
+    filtered = df[df["decision_year"].isin(selected_years)] if selected_years else df
+
+    total = len(filtered)
+    accepts = int((filtered["decision_group"] == "Accept").sum())
+    rejects = int((filtered["decision_group"] == "Reject").sum())
+    acc_rate = accepts / max(accepts + rejects, 1)
+    median_days = filtered["days_to_decision"].median()
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total decisions", f"{total:,}")
+    k2.metric("Accepted", f"{accepts:,}")
+    k3.metric("Rejected", f"{rejects:,}")
+    k4.metric("Acceptance rate", f"{acc_rate:.1%}")
+    k5.metric("Median time to decision", "—" if pd.isna(median_days) else f"{median_days:.0f} days")
+
+    st.divider()
+    chart_df = filtered.dropna(subset=["decision_date"]).copy()
+    if chart_df.empty:
+        st.warning("No valid decision dates available for monthly charts.")
+    else:
+        monthly = chart_df.groupby(["decision_year", "month_num", "month_name", "decision_group"], as_index=False).size().rename(columns={"size": "decisions"})
+        monthly["month_label"] = monthly["decision_year"].astype(int).astype(str) + " " + monthly["month_name"]
+        section_title("Accepts and rejects per month")
+        fig = px.bar(monthly, x="month_label", y="decisions", color="decision_group", barmode="group", color_discrete_map={"Accept": ERJ_TEAL, "Reject": ERJ_RED, "Other": ERJ_GREY})
+        fig.update_layout(height=420, xaxis_title="Month", yaxis_title="Decisions", legend_title="Decision")
+        st.plotly_chart(fig, use_container_width=True)
+
+        section_title("Month-by-month tracker")
+        monthly_total = chart_df.groupby(["decision_year", "month_num", "month_name"], as_index=False).agg(
+            decisions=("manuscript_id", "count"),
+            accepts=("decision_group", lambda s: (s == "Accept").sum()),
+            rejects=("decision_group", lambda s: (s == "Reject").sum()),
+            median_days=("days_to_decision", "median"),
+        )
+        monthly_total["acceptance_rate"] = monthly_total["accepts"] / (monthly_total["accepts"] + monthly_total["rejects"]).clip(lower=1)
+        monthly_total["month_label"] = monthly_total["decision_year"].astype(int).astype(str) + " " + monthly_total["month_name"]
+        fig2 = px.line(monthly_total, x="month_label", y=["decisions", "accepts", "rejects"], markers=True)
+        fig2.update_layout(height=380, xaxis_title="Month", yaxis_title="Count", legend_title="Metric")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    left, right = st.columns(2)
+    with left:
+        section_title("Breakdown by study type")
+        type_counts = filtered.groupby(["study_type", "decision_group"], as_index=False).size().rename(columns={"size": "decisions"}).sort_values("decisions", ascending=False)
+        if not type_counts.empty:
+            fig3 = px.bar(type_counts, x="decisions", y="study_type", color="decision_group", orientation="h", color_discrete_map={"Accept": ERJ_TEAL, "Reject": ERJ_RED, "Other": ERJ_GREY})
+            fig3.update_layout(height=420, yaxis_title="", xaxis_title="Decisions")
+            st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.caption("No study type data.")
+    with right:
+        section_title("Breakdown by topic")
+        topic_rows = []
+        for _, row in filtered.iterrows():
+            tags = [t.strip() for t in str(row.get("themes", "")).split(";") if t.strip()]
+            if not tags:
+                tags = ["Unclassified"]
+            for tag in tags:
+                topic_rows.append({"theme": tag, "decision_group": row.get("decision_group", "Other")})
+        topic_df = pd.DataFrame(topic_rows)
+        if not topic_df.empty:
+            topic_counts = topic_df.groupby(["theme", "decision_group"], as_index=False).size().rename(columns={"size": "decisions"})
+            top_themes = topic_counts.groupby("theme")["decisions"].sum().sort_values(ascending=False).head(15).index
+            fig4 = px.bar(topic_counts[topic_counts["theme"].isin(top_themes)], x="decisions", y="theme", color="decision_group", orientation="h", color_discrete_map={"Accept": ERJ_TEAL, "Reject": ERJ_RED, "Other": ERJ_GREY})
+            fig4.update_layout(height=420, yaxis_title="", xaxis_title="Decisions")
+            st.plotly_chart(fig4, use_container_width=True)
+        else:
+            st.caption("No topic data.")
+
+    section_title("Median time to decision by month")
+    if not chart_df.empty:
+        med = chart_df.groupby(["decision_year", "month_num", "month_name"], as_index=False)["days_to_decision"].median().dropna()
+        if not med.empty:
+            med["month_label"] = med["decision_year"].astype(int).astype(str) + " " + med["month_name"]
+            fig5 = px.bar(med, x="month_label", y="days_to_decision")
+            fig5.update_layout(height=320, xaxis_title="Month", yaxis_title="Median days")
+            st.plotly_chart(fig5, use_container_width=True)
+
+    section_title("Decision records")
+    show_cols = ["manuscript_id", "title", "submitted_date", "decision_date", "study_type", "decision", "themes", "days_to_decision"]
+    st.dataframe(filtered[show_cols].sort_values("decision_date", ascending=False), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download decision records CSV",
+        normalise_decision_df(df).to_csv(index=False),
+        "erjor_decision_records.csv",
+        "text/csv",
+    )
+
+
 inject_css()
 sidebar_logo()
 
@@ -997,6 +1276,7 @@ with st.sidebar:
         [
             "1. Year to Date",
             "2. Impact Factor",
+            "3. Decision Tracker",
         ],
         label_visibility="collapsed",
     )
@@ -1033,5 +1313,7 @@ if snaps.empty:
 
 if page.startswith("1."):
     year_to_date_page(snaps)
-else:
+elif page.startswith("2."):
     impact_factor_page(snaps)
+else:
+    decision_tracker_page()
