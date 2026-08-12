@@ -52,7 +52,7 @@ ISSN = "2312-0541"          # ERJ Open Research
 SELECT = ",".join([
     "id", "doi", "title", "publication_year", "publication_date",
     "type", "cited_by_count", "counts_by_year", "authorships",
-    "primary_topic", "open_access",
+    "primary_topic", "open_access", "abstract_inverted_index", "biblio",
 ])
 
 
@@ -116,6 +116,25 @@ def fetch_works(source_id, year_from, year_to, mailto):
     return works
 
 
+def rebuild_abstract(inv):
+    """OpenAlex stores abstracts as {word: [positions]}. Reassemble the text.
+
+    Presence or absence of an abstract is often a good proxy for content type:
+    original articles carry one, research letters and correspondence usually
+    do not. Validate that against a known citable-item list before relying on
+    it - coverage depends on what the publisher deposited with Crossref.
+    """
+    if not inv:
+        return ""
+    pos = {}
+    for word, places in inv.items():
+        for p in places:
+            pos[p] = word
+    if not pos:
+        return ""
+    return " ".join(pos[i] for i in sorted(pos))
+
+
 def flatten(works):
     """One row per work, with citations-per-year expanded into columns."""
     rows = []
@@ -127,6 +146,18 @@ def flatten(works):
         countries = sorted({c for a in auths
                             for c in (a.get("countries") or [])})
         topic = (w.get("primary_topic") or {}).get("display_name", "")
+        abstract = rebuild_abstract(w.get("abstract_inverted_index"))
+        bib = w.get("biblio") or {}
+
+        def _page(v):
+            try:
+                return int(str(v).strip())
+            except (TypeError, ValueError):
+                return None
+
+        fp, lp = _page(bib.get("first_page")), _page(bib.get("last_page"))
+        n_pages = (lp - fp + 1) if (fp is not None and lp is not None
+                                    and lp >= fp) else None
         rows.append({
             "openalex_id": w["id"].rsplit("/", 1)[-1],
             "doi": (w.get("doi") or "").replace("https://doi.org/", ""),
@@ -139,6 +170,12 @@ def flatten(works):
             "openalex_type": w.get("type"),
             "primary_topic": topic,
             "is_oa": (w.get("open_access") or {}).get("is_oa"),
+            "abstract": abstract,
+            "has_abstract": bool(abstract),
+            "abstract_words": len(abstract.split()) if abstract else 0,
+            "first_page": bib.get("first_page"),
+            "last_page": bib.get("last_page"),
+            "n_pages": n_pages,
             "cited_by_count_total": w.get("cited_by_count", 0),
             "cites_2022": by_year.get(2022, 0),
             "cites_2023": by_year.get(2023, 0),
@@ -207,6 +244,14 @@ def main():
     print(f"\nRetrieved {len(df)} works -> openalex_raw_works.csv")
     print("\nBy publication year and type:")
     print(pd.crosstab(df["Publication Year"], df["openalex_type"]).to_string())
+
+    print("\nAbstract coverage (proxy for content type):")
+    cov = df.groupby("Publication Year")["has_abstract"].agg(["sum", "size"])
+    cov["% with abstract"] = (cov["sum"] / cov["size"] * 100).round(1)
+    print(cov.to_string())
+    print("  If coverage is near 100% or near 0% for every year, abstracts")
+    print("  carry no information about content type here. A split roughly")
+    print("  matching the citable-item share means the proxy is usable.")
 
     citable = not args.include_noncitable
     w24 = build_window(df, 2024, citable)

@@ -14,6 +14,8 @@ single source of truth for both the app and the command line.
 
 import io
 import math
+import re
+import unicodedata
 from datetime import date
 
 import altair as alt
@@ -33,6 +35,27 @@ WOS_2024 = {"items": 515, "zero": 74, "one": 103, "median": 3, "max": 60}
 # ---------------------------------------------------------------------------
 # Small statistics helpers (kept dependency-free)
 # ---------------------------------------------------------------------------
+
+GREEK = {"\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma",
+         "\u03b4": "delta", "\u03ba": "kappa", "\u03bc": "mu"}
+
+
+def match_key(title):
+    """Loose title key for matching across databases.
+
+    Greek letters, HTML tags and punctuation are all rendered differently by
+    Web of Science and OpenAlex, so they are normalised away before matching.
+    """
+    t = str(title)
+    for g, n in GREEK.items():
+        t = t.replace(g, n)
+    for bad, good in C.MOJIBAKE.items():
+        t = t.replace(bad, good)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = unicodedata.normalize("NFKD", t).lower()
+    t = re.sub(r"[^a-z0-9 ]", " ", t)
+    return " ".join(t.split())[:70]
+
 
 def _norm_cdf(z):
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
@@ -194,6 +217,13 @@ else:
     citable_only = True
 
 st.sidebar.divider()
+gold = st.sidebar.file_uploader(
+    "Optional: Web of Science export, to validate content type",
+    type=["xlsx"],
+    help="A JCR citable-items export. Used to test whether abstract presence "
+         "identifies the same papers JCR counts.")
+
+st.sidebar.divider()
 st.sidebar.caption("Coding rules are shared with the command-line scripts. "
                    "Edit classify.py to change them.")
 
@@ -282,7 +312,8 @@ if prev_l is not None:
         f"Both windows come from the same database, so they are comparable.")
 
 tabs = st.tabs(["Overview", "By theme", "By methodology", "Theme \u00d7 method",
-                "Zero-cited papers", "Year on year", "Calibration", "Codebook"])
+                "Zero-cited papers", "Year on year", "Content type",
+                "Calibration", "Codebook"])
 
 # --- overview ---
 with tabs[0]:
@@ -488,8 +519,96 @@ with tabs[5]:
             st.dataframe(still[["Item Title", "Theme"]],
                          use_container_width=True, hide_index=True)
 
-# --- calibration ---
+# --- content type ---
 with tabs[6]:
+    st.markdown("### Is 'has an abstract' a usable proxy for citable items?")
+    st.caption(
+        "JCR counts original articles and reviews, but excludes research "
+        "letters and correspondence. OpenAlex types most of those as "
+        "'article', which inflates the denominator. Original articles usually "
+        "carry an abstract and letters usually do not \u2014 so abstract presence "
+        "may separate them. This panel tests that rather than assuming it.")
+
+    both = pd.concat([d for d in (prev_l, cur_l) if d is not None])
+    both = both.drop_duplicates("openalex_id") if "openalex_id" in both else both
+
+    if "has_abstract" not in both.columns:
+        st.warning(
+            "This dataset was built before abstracts were collected. Re-run "
+            "the fetch with the current fetch_openalex.py to populate them.")
+    else:
+        cov = (both.groupby("Publication Year")["has_abstract"]
+               .agg(With_abstract="sum", Papers="size").reset_index())
+        cov["% with abstract"] = (cov.With_abstract / cov.Papers * 100).round(1)
+        st.dataframe(cov, use_container_width=True, hide_index=True)
+
+        z = both.groupby("has_abstract").agg(
+            Papers=("Zero_cited", "size"), Zero=("Zero_cited", "sum"),
+            Median=("Number of Citations", "median")).reset_index()
+        z["% zero"] = (z.Zero / z.Papers * 100).round(1)
+        z["has_abstract"] = z.has_abstract.map({True: "Has abstract",
+                                                False: "No abstract"})
+        st.markdown("**Citation profile by abstract presence**")
+        st.dataframe(z, use_container_width=True, hide_index=True)
+        st.caption(
+            "A large gap here is what makes the proxy useful: items without "
+            "abstracts behaving like letters (few citations, many zeros) is "
+            "the pattern to look for.")
+
+        if gold is not None:
+            try:
+                wos = C.load_wos(gold)
+            except Exception as exc:
+                st.error(f"Could not read that file: {exc}")
+                wos = None
+            if wos is not None:
+                ws = set(wos["Item Title"].map(match_key))
+                both["_k"] = both["Item Title"].map(match_key)
+                both["in_wos"] = both._k.isin(ws)
+                yrs = sorted(set(wos["Publication Year"].dropna().astype(int)))
+                v = both[both["Publication Year"].isin(yrs)]
+                ct = pd.crosstab(v.has_abstract, v.in_wos)
+                st.markdown("**Validation against the Web of Science list**")
+                st.caption(f"Restricted to publication years {yrs}, which are "
+                           "the years the uploaded export covers.")
+                st.dataframe(ct, use_container_width=True)
+                tp = int(ct.loc[True, True]) if True in ct.index and True in ct.columns else 0
+                fp_ = int(ct.loc[True, False]) if True in ct.index and False in ct.columns else 0
+                fn = int(ct.loc[False, True]) if False in ct.index and True in ct.columns else 0
+                tn = int(ct.loc[False, False]) if False in ct.index and False in ct.columns else 0
+                if tp + fn and tp + fp_:
+                    sens, prec = tp / (tp + fn), tp / (tp + fp_)
+                    spec = tn / (tn + fp_) if (tn + fp_) else float("nan")
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("Sensitivity", f"{sens * 100:.0f}%",
+                              "citable papers that have an abstract",
+                              delta_color="off")
+                    k2.metric("Precision", f"{prec * 100:.0f}%",
+                              "papers with abstracts that are citable",
+                              delta_color="off")
+                    k3.metric("Specificity", f"{spec * 100:.0f}%",
+                              "non-citable papers correctly excluded",
+                              delta_color="off")
+                    if prec > 0.9 and spec > 0.6:
+                        st.success(
+                            "The proxy separates the two groups well enough to "
+                            "use. Filtering to papers with abstracts should "
+                            "bring the denominator close to the JCR count, and "
+                            "the abstract share for a year without a WoS "
+                            "export becomes an estimate of its research-letter "
+                            "content.")
+                    else:
+                        st.warning(
+                            "The separation is too weak to rely on. Ask the "
+                            "publications team for the article-type counts "
+                            "instead \u2014 abstract presence is not tracking "
+                            "content type in this journal.")
+        else:
+            st.info("Upload a Web of Science export in the sidebar to test the "
+                    "proxy against a known citable-item list.")
+
+# --- calibration ---
+with tabs[7]:
     st.markdown("**Sanity check against Web of Science**")
     if source == "OpenAlex (live)" and 2024 in (this_jcr, prev_jcr):
         w = cur_l if this_jcr == 2024 else prev_l
@@ -517,7 +636,7 @@ with tabs[6]:
                 "Web of Science result.")
 
 # --- codebook ---
-with tabs[7]:
+with tabs[8]:
     st.caption("Rules are applied in the order shown. A paper scores one point "
                "per distinct pattern matched; highest score wins, ties broken "
                "by position in this list.")
