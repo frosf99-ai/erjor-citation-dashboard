@@ -13,6 +13,7 @@ single source of truth for both the app and the command line.
 """
 
 import io
+import math
 from datetime import date
 
 import altair as alt
@@ -26,6 +27,45 @@ st.set_page_config(page_title="ERJOR Citation Analysis",
                    page_icon="\U0001F4CA", layout="wide")
 
 WOS_2024 = {"items": 515, "zero": 74, "one": 103, "median": 3, "max": 60}
+
+
+
+# ---------------------------------------------------------------------------
+# Small statistics helpers (kept dependency-free)
+# ---------------------------------------------------------------------------
+
+def _norm_cdf(z):
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+
+def two_proportion_test(x1, n1, x2, n2):
+    """Compare two independent proportions. Returns (diff_pts, ci_lo, ci_hi, p)."""
+    if n1 == 0 or n2 == 0:
+        return (float("nan"),) * 4
+    p1, p2 = x1 / n1, x2 / n2
+    diff = p2 - p1
+    se = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
+    lo, hi = diff - 1.96 * se, diff + 1.96 * se
+    pool = (x1 + x2) / (n1 + n2)
+    se0 = math.sqrt(pool * (1 - pool) * (1 / n1 + 1 / n2))
+    p = 2 * (1 - _norm_cdf(abs(diff) / se0)) if se0 > 0 else float("nan")
+    return diff * 100, lo * 100, hi * 100, p
+
+
+def mcnemar_exact(b, c):
+    """Exact paired test on discordant pairs b and c."""
+    n = b + c
+    if n == 0:
+        return float("nan")
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / (2 ** n)
+    return min(1.0, 2 * tail)
+
+
+def fmt_p(p):
+    if p != p:
+        return "n/a"
+    return "<0.001" if p < 0.001 else f"{p:.3f}"
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +396,61 @@ with tabs[5]:
         st.dataframe(m.sort_values("Change (pts)"),
                      use_container_width=True, hide_index=True)
 
+        st.divider()
+        st.markdown("### Age-matched cohort comparison")
+        st.caption(
+            "Each window contains a younger and an older cohort. Comparing "
+            "like with like removes the citation-ageing effect, so a "
+            "difference here reflects what was published rather than how long "
+            "it has had to be cited.")
+
+        pairs = [
+            ("Younger cohort", prev_jcr - 1, this_jcr - 1),
+            ("Older cohort", prev_jcr - 2, this_jcr - 2),
+        ]
+        rows = []
+        for lab, y_old, y_new in pairs:
+            a = prev_l[prev_l["Publication Year"] == y_old]
+            b = cur_l[cur_l["Publication Year"] == y_new]
+            if a.empty or b.empty:
+                continue
+            x1, n1 = int(a.Zero_cited.sum()), len(a)
+            x2, n2 = int(b.Zero_cited.sum()), len(b)
+            d, lo, hi, p = two_proportion_test(x1, n1, x2, n2)
+            rows.append({
+                "Cohort": lab,
+                f"{y_old} papers (in {prev_jcr})": f"{x1}/{n1} "
+                                                   f"({x1 / n1 * 100:.1f}%)",
+                f"{y_new} papers (in {this_jcr})": f"{x2}/{n2} "
+                                                   f"({x2 / n2 * 100:.1f}%)",
+                "Change (pts)": f"{d:+.1f}",
+                "95% CI": f"{lo:+.1f} to {hi:+.1f}",
+                "p": fmt_p(p),
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True)
+            st.caption(
+                "A confidence interval spanning zero means the data are also "
+                "consistent with no change. With a few hundred papers per "
+                "cohort, only fairly large shifts will be distinguishable "
+                "from chance \u2014 worth saying out loud if the board reads a "
+                "small movement as progress.")
+
+        st.divider()
+        st.markdown("### Unadjusted comparison (interpret with care)")
+        za, na = int(prev_l.Zero_cited.sum()), len(prev_l)
+        zb, nb = int(cur_l.Zero_cited.sum()), len(cur_l)
+        u1, u2 = st.columns(2)
+        u1.metric(f"{prev_jcr} window", f"{za / na * 100:.1f}%",
+                  f"{za} of {na}", delta_color="off")
+        u2.metric(f"{this_jcr} window", f"{zb / nb * 100:.1f}%",
+                  f"{zb} of {nb}", delta_color="off")
+        st.caption(
+            "These two windows share a publication year, so they are not "
+            "independent samples, and the cohorts differ in age. Use the "
+            "age-matched table above for any claim about improvement.")
+
         overlap = sorted(set(prev_l["Publication Year"])
                          & set(cur_l["Publication Year"]))
         if overlap:
@@ -377,11 +472,19 @@ with tabs[5]:
             if len(was_zero):
                 k3.metric("Picked up citations",
                           f"{(1 - len(still) / len(was_zero)) * 100:.0f}%")
+            gained = len(was_zero) - len(still)
+            lost = int(((j[f"Number of Citations_{prev_jcr}"] > 0)
+                        & (j[f"Number of Citations_{this_jcr}"] == 0)).sum())
+            pv = mcnemar_exact(gained, lost)
             st.caption(
-                "Papers appearing in both windows are the same papers, matched "
-                "on identifier. Those that stay at zero are persistently "
+                f"Same papers, matched on identifier: {gained} moved off zero "
+                f"while {lost} fell back to zero (paired exact test "
+                f"p={fmt_p(pv)}). Papers that stay at zero are persistently "
                 "uncited rather than merely slow \u2014 that distinction is what "
-                "makes this actionable.")
+                "makes this actionable. Note this is expected to improve on "
+                "ageing alone, so treat it as a measure of how much "
+                "uncitedness is temporary, not as evidence of editorial "
+                "change.")
             st.dataframe(still[["Item Title", "Theme"]],
                          use_container_width=True, hide_index=True)
 
