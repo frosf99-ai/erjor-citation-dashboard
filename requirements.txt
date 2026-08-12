@@ -1,8 +1,5 @@
 streamlit>=1.36
 pandas>=2.0
-plotly>=5.20
 requests>=2.31
-
-statsmodels>=0.14
-odfpy>=1.4.1
-openpyxl>=3.1.0
+openpyxl>=3.1
+altair>=5.0

@@ -1,1319 +1,445 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""
+ERJOR Citation Analysis - Streamlit app.
 
-import datetime as dt
+Pulls ERJ Open Research citable items from OpenAlex (or accepts a Web of
+Science export), rebuilds JCR-style citation windows, applies the agreed
+thematic and methodological coding frame, and produces the tables and charts
+for the editorial meeting.
+
+The coding rules live in classify.py and the OpenAlex logic in
+fetch_openalex.py - this file is presentation only, so the codebook stays a
+single source of truth for both the app and the command line.
+"""
+
 import io
-import json
-import os
-import re
-import sqlite3
-from pathlib import Path
-from typing import Iterable
+from datetime import date
 
+import altair as alt
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
-from fetch_openalex import connect, fetch_window, publication_window
-
-DB_PATH = Path("erjor_citations.sqlite")
-DEFAULT_MAILTO = os.environ.get("OPENALEX_MAILTO", "freddy.frost@lhch.nhs.uk")
-TODAY = dt.date.today()
-
-ERJ_BLUE = "#004B93"
-ERJ_DARK_BLUE = "#003366"
-ERJ_RED = "#E30613"
-ERJ_TEAL = "#008C95"
-ERJ_PURPLE = "#5B4BB2"
-ERJ_GREY = "#667085"
-ERJ_LIGHT = "#F6F8FB"
-PLOTLY_COLORS = [ERJ_BLUE, ERJ_RED, ERJ_TEAL, ERJ_PURPLE, "#7A869A", "#00A3E0", "#E87722"]
-
-st.set_page_config(
-    page_title="ERJOR Editorial Intelligence",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-DISEASE_THEME_RULES = {
-    "Bronchiectasis": ["bronchiectasis", "ntm", "nontuberculous mycobacter"],
-    "COPD": ["copd", "chronic obstructive", "emphysema"],
-    "Asthma": ["asthma", "eosinophil", "airway hyperresponsiveness"],
-    "ILD": ["interstitial lung", "ild", "pulmonary fibrosis", "sarcoidosis", "hypersensitivity pneumonitis"],
-    "Pulmonary vascular disease": ["pulmonary hypertension", "pulmonary vascular", "embolism"],
-    "Respiratory infection": ["infection", "pneumonia", "tuberculosis", "covid", "influenza", "virus", "bacterial", "mycobacter"],
-    "Lung cancer": ["lung cancer", "thoracic oncology", "mesothelioma", "tumour", "tumor", "neoplasm"],
-    "Sleep medicine": ["sleep", "obstructive sleep apnoea", "obstructive sleep apnea", "osa"],
-    "Pulmonary rehabilitation": ["pulmonary rehabilitation", "exercise", "physical activity", "rehabilitation"],
-    "Critical care": ["critical care", "intensive care", "icu", "ards", "ventilation", "mechanical ventilation"],
-    "Respiratory physiology": ["physiology", "lung function", "spirometry", "gas exchange", "ventilatory"],
-    "Imaging": ["imaging", "ct", "computed tomography", "radiology", "ultrasound", "mri"],
-    "Digital health": ["digital", "telemedicine", "remote monitoring", "wearable", "app", "machine learning", "artificial intelligence", " ai "],
-    "Airway disease": ["airway", "small airways", "airflow", "obstructive airway"],
-    "Environmental/occupational": ["environment", "occupational", "pollution", "air quality", "exposure", "smoking", "vaping"],
-    "Rare lung disease": ["rare", "alpha-1", "lymphangioleiomyomatosis", "lam", "cystic fibrosis"],
-}
-
-METHOD_THEME_RULES = {
-    "Clinical research": ["cohort", "patient", "clinical", "mortality", "prognosis", "registry", "observational", "case-control", "case control", "outcome"],
-    "Basic science": ["mouse", "mice", "cell", "in vitro", "molecular", "pathway", "animal model", "mechanism", "gene", "protein"],
-    "Translational research": ["biomarker", "translational", "phenotype", "endotype", "omics", "genomic", "proteomic", "precision medicine"],
-    "Epidemiology": ["epidemiology", "prevalence", "incidence", "population", "burden", "risk factor"],
-    "Health services research": ["health service", "quality of care", "implementation", "pathway", "service", "access", "delivery"],
-    "Clinical trials": ["randomised", "randomized", "trial", "placebo", "phase 2", "phase ii", "phase 3", "phase iii"],
-    "Systematic review/meta-analysis": ["systematic review", "meta-analysis", "meta analysis"],
-    "Artificial intelligence": ["artificial intelligence", "machine learning", "deep learning", "algorithm", " ai "],
-    "Implementation science": ["implementation", "adoption", "feasibility", "barrier", "facilitator"],
-}
-
-
-def inject_css() -> None:
-    st.markdown(
-        f"""
-        <style>
-        :root {{
-            --ers-navy: #002b5c;
-            --ers-blue: #004b93;
-            --ers-mid-blue: #0067b1;
-            --ers-red: #e30613;
-            --ers-teal: #008c95;
-            --ers-light: #f5f8fc;
-            --ers-border: #d8dee9;
-            --ers-text: #101828;
-        }}
-        .stApp {{
-            background: radial-gradient(circle at top right, rgba(0,75,147,.08), transparent 30%), #ffffff;
-        }}
-        .block-container {{ padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1600px; }}
-        section[data-testid="stSidebar"] {{
-            background:
-              radial-gradient(circle at 15% 96%, rgba(255,255,255,.12) 0 2px, transparent 2px) 0 0/18px 18px,
-              linear-gradient(180deg, #003b71 0%, #004b93 45%, #002b5c 100%);
-            box-shadow: 8px 0 30px rgba(0,43,92,.14);
-        }}
-        section[data-testid="stSidebar"] * {{ color: white !important; }}
-        section[data-testid="stSidebar"] .stRadio > label {{ display:none; }}
-        section[data-testid="stSidebar"] div[role="radiogroup"] label {{
-            padding: .85rem .8rem;
-            border-radius: 12px;
-            margin: .18rem 0;
-            border: 1px solid rgba(255,255,255,.08);
-        }}
-        section[data-testid="stSidebar"] div[role="radiogroup"] label:hover {{
-            background: rgba(255,255,255,.10);
-        }}
-        .ers-sidebar-brand {{ padding: 18px 8px 24px 0; }}
-        .ers-logo-row {{ display:flex; gap:14px; align-items:flex-start; }}
-        .ers-mark {{
-            width:64px; height:64px; border-radius:50%;
-            background: var(--ers-red);
-            box-shadow: 0 8px 24px rgba(0,0,0,.22);
-            position:relative; flex: 0 0 64px;
-        }}
-        .ers-mark:before {{
-            content:""; position:absolute; inset:13px;
-            background:
-              radial-gradient(circle, #fff 0 2px, transparent 2.5px) 0 0/9px 9px;
-            opacity:.95; border-radius:50%;
-        }}
-        .ers-wordmark .ers {{ font-size:2.35rem; font-weight:900; letter-spacing:.02em; line-height:.86; }}
-        .ers-wordmark .society {{ font-size:.78rem; font-weight:800; line-height:1.15; margin-top:6px; letter-spacing:.04em; }}
-        .journal-lockup {{ margin-top:26px; }}
-        .journal-lockup .journal-title {{ font-size:1.15rem; font-weight:900; letter-spacing:.01em; }}
-        .journal-lockup .journal-sub {{ margin-top:7px; font-size:.84rem; line-height:1.4; opacity:.96; }}
-        .sidebar-footer {{
-            margin-top:32px; padding-top:20px; border-top:1px solid rgba(255,255,255,.35);
-            font-size:.82rem; line-height:1.45; opacity:.95;
-        }}
-        .ers-topbar {{
-            display:flex; justify-content:space-between; align-items:flex-start; gap:24px;
-            border-bottom:1px solid #e4e9f2; padding-bottom:14px; margin-bottom:18px;
-        }}
-        .ers-product {{ font-size:1.45rem; font-weight:900; letter-spacing:.04em; color:var(--ers-blue); }}
-        .ers-product span {{ color:var(--ers-red); }}
-        .ers-right-lockup {{
-            color:var(--ers-blue); font-weight:850; letter-spacing:.03em; line-height:1.15; text-align:left;
-            display:flex; align-items:flex-start; gap:22px;
-        }}
-        .ers-right-lockup .open {{ color:var(--ers-red); margin-top:6px; }}
-        .ers-lungs {{ width:76px; height:54px; position:relative; margin-top:2px; }}
-        .ers-lungs:before, .ers-lungs:after {{ content:""; position:absolute; width:28px; height:48px; border-radius: 60% 60% 45% 45%; top:2px; }}
-        .ers-lungs:before {{ left:5px; border-left:8px dotted var(--ers-blue); border-top:8px dotted var(--ers-blue); transform:rotate(16deg); }}
-        .ers-lungs:after {{ right:5px; border-right:8px dotted var(--ers-red); border-top:8px dotted var(--ers-red); transform:rotate(-16deg); }}
-        .erj-header {{ margin-bottom: 1rem; }}
-        .erj-title h1 {{ color: var(--ers-navy); font-size:2.05rem; font-weight:900; margin:0; line-height:1.1; }}
-        .erj-title p {{ color:#455a7a; font-size:1.1rem; margin:.45rem 0 0 0; }}
-        .erj-subnote {{ color:#53637a; font-size:.88rem; margin:.8rem 0 0 0; }}
-        div[data-testid="stMetric"] {{
-            background:#fff; border:1px solid var(--ers-border); border-radius:14px;
-            padding:18px 18px 14px 18px; box-shadow:0 2px 14px rgba(16,24,40,.045);
-            min-height:142px; position:relative; overflow:hidden;
-        }}
-        div[data-testid="stMetric"]:before {{
-            content:""; position:absolute; left:0; top:0; bottom:0; width:5px; background:var(--ers-blue);
-        }}
-        div[data-testid="stMetric"]:nth-of-type(3):before {{ background:var(--ers-red); }}
-        div[data-testid="stMetricLabel"] p {{
-            color: var(--ers-blue) !important; font-weight:900 !important; text-transform:uppercase;
-            font-size:.75rem !important; letter-spacing:.02em;
-        }}
-        div[data-testid="stMetricValue"] {{ color:var(--ers-text); font-weight:900; }}
-        div[data-testid="stMetricDelta"] {{ color:var(--ers-red) !important; }}
-        .section-card {{
-            background:#fff; border:1px solid var(--ers-border); border-radius:14px;
-            padding:16px 18px; box-shadow:0 2px 14px rgba(16,24,40,.045); margin-bottom:14px;
-        }}
-        .section-card h3, h3 {{ color:var(--ers-blue) !important; text-transform:uppercase; font-size:.9rem !important; letter-spacing:.02em; }}
-        .pill {{ display:inline-block; background:#eef4ff; color:var(--ers-blue); border:1px solid #c7d7fe; border-radius:999px; padding:3px 10px; margin:2px 4px 2px 0; font-size:.78rem; font-weight:700; }}
-        div[data-testid="stDataFrame"] {{ border:1px solid var(--ers-border); border-radius:12px; }}
-        .stDownloadButton button, button[kind="primary"] {{ background:var(--ers-blue) !important; color:white !important; border:0 !important; }}
-        .stButton button {{ border-radius:10px; }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-def sidebar_logo() -> None:
-    st.sidebar.markdown(
-        """
-        <div class="ers-sidebar-brand">
-          <div class="ers-logo-row">
-            <div class="ers-mark"></div>
-            <div class="ers-wordmark">
-              <div class="ers">ERS</div>
-              <div class="society">EUROPEAN<br/>RESPIRATORY<br/>SOCIETY</div>
-            </div>
-          </div>
-          <div class="journal-lockup">
-            <div class="journal-title">ERJ OPEN RESEARCH</div>
-            <div class="journal-sub">Advancing open respiratory<br/>science for better health</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-def page_header(title: str, subtitle: str, cohort: str | None = None, updated: str | None = None) -> None:
-    details = []
-    if cohort:
-        details.append(f"Analysis period: {cohort}")
-    if updated:
-        details.append(f"Updated: {updated}")
-    details_text = " &nbsp; | &nbsp; ".join(details)
-    st.markdown(
-        f"""
-        <div class="ers-topbar">
-          <div class="ers-product">ERJ <span>OPEN RESEARCH</span></div>
-          <div class="ers-right-lockup">
-            <div>EUROPEAN RESPIRATORY<br/>JOURNAL<div class="open">OPEN RESEARCH</div></div>
-            <div class="ers-lungs"></div>
-          </div>
-        </div>
-        <div class="erj-header">
-          <div class="erj-title">
-            <h1>{title}</h1>
-            <p>{subtitle}</p>
-            <div class="erj-subnote">ⓘ {details_text}</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-def section_title(title: str, caption: str | None = None) -> None:
-    cap = f"<div style='color:{ERJ_GREY}; font-size:.9rem; margin-top:-.35rem'>{caption}</div>" if caption else ""
-    st.markdown(f"<h3 style='color:{ERJ_BLUE}; text-transform:uppercase; font-size:.95rem; letter-spacing:.02em'>{title}</h3>{cap}", unsafe_allow_html=True)
-
-
-def json_text(value: str | None) -> str:
-    if not value:
-        return ""
-    try:
-        parsed = json.loads(value)
-    except Exception:
-        return str(value)
-    chunks: list[str] = []
-
-    def walk(x):
-        if isinstance(x, dict):
-            for key in ("display_name", "name", "description", "keyword"):
-                if x.get(key):
-                    chunks.append(str(x[key]))
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, list):
-            for item in x:
-                walk(item)
-
-    walk(parsed)
-    return " ".join(chunks)
-
-
-def tag_themes(row: pd.Series) -> list[str]:
-    text = " ".join(str(row.get(c) or "") for c in ["title", "work_type", "article_type"])
-    text += " " + json_text(row.get("concepts_json")) + " " + json_text(row.get("topics_json")) + " " + json_text(row.get("keywords_json"))
-    haystack = f" {text.lower()} "
-    themes = []
-    for theme, terms in {**DISEASE_THEME_RULES, **METHOD_THEME_RULES}.items():
-        if any(term.strip() in haystack for term in terms):
-            themes.append(theme)
-    return themes or ["Other/uncategorised"]
-
-
-def citation_count_between(row: pd.Series, start: dt.date, end: dt.date) -> int:
-    """Estimate citations from citing works published within date window.
-
-    OpenAlex gives counts_by_year rather than exact citing dates in the basic work
-    record. We prorate each calendar-year citation bucket by the overlap with the
-    requested window. This is a good dashboard estimate; exact values require
-    fetching every citing work and checking its publication date.
-    """
-    try:
-        counts = json.loads(row.get("counts_by_year_json") or "[]")
-    except Exception:
-        counts = []
-    total = 0.0
-    for item in counts:
-        year = int(item.get("year", 0) or 0)
-        count = int(item.get("cited_by_count", 0) or 0)
-        if not year or not count:
-            continue
-        y0, y1 = dt.date(year, 1, 1), dt.date(year + 1, 1, 1)
-        overlap = max(0, (min(end, y1) - max(start, y0)).days)
-        if overlap:
-            total += count * (overlap / (y1 - y0).days)
-    return int(round(total))
-
-
-def last_365_citations(row: pd.Series, as_of: dt.date) -> int:
-    return citation_count_between(row, as_of - dt.timedelta(days=365), as_of)
-
-
-def first_12m_citations(row: pd.Series) -> int:
-    pub = pd.to_datetime(row.get("publication_date"), errors="coerce")
-    if pd.isna(pub):
-        return 0
-    start = pub.date()
-    return citation_count_between(row, start, start + dt.timedelta(days=365))
-
-
-def snapshot_exists_for_today(db_path: Path) -> bool:
-    if not db_path.exists():
-        return False
-    try:
-        con = sqlite3.connect(db_path)
-        today = dt.date.today().isoformat()
-        row = con.execute("SELECT COUNT(*) FROM citation_snapshots WHERE snapshot_date = ?", (today,)).fetchone()
-        con.close()
-        return bool(row and row[0] > 0)
-    except sqlite3.Error:
-        return False
-
-
-def fetch_latest_data(db_path: Path, mailto: str, min_age_months: int = 0, max_age_months: int = 60) -> int:
-    connect(str(db_path)).close()
-    today = dt.date.today()
-    start_date, end_date = publication_window(today, min_age_months, max_age_months)
-    progress = st.progress(0, text=f"Fetching ERJOR works published {start_date} to {end_date} from OpenAlex...")
-    total = fetch_window(str(db_path), mailto, start_date, end_date, today.isoformat())
-    progress.progress(100, text=f"Fetched {total:,} ERJOR works.")
-    return total
-
-
-@st.cache_data(ttl=300)
-def load_data(db_path: str):
-    if not Path(db_path).exists():
-        return pd.DataFrame(), pd.DataFrame()
-    con = sqlite3.connect(db_path)
-    try:
-        works = pd.read_sql_query("SELECT * FROM works", con)
-        snaps = pd.read_sql_query(
-            """
-            SELECT s.snapshot_date, s.openalex_id, s.cited_by_count,
-                   w.title, w.doi, w.publication_date, w.publication_year,
-                   w.work_type, w.article_type, w.authors, w.first_author,
-                   w.institutions, w.landing_page_url, w.concepts_json,
-                   w.topics_json, w.keywords_json, w.counts_by_year_json
-            FROM citation_snapshots s
-            JOIN works w USING(openalex_id)
-            """,
-            con,
-        )
-    except Exception:
-        works, snaps = pd.DataFrame(), pd.DataFrame()
-    finally:
-        con.close()
-    for df in (works, snaps):
-        if not df.empty and "publication_date" in df:
-            df["publication_date"] = pd.to_datetime(df["publication_date"], errors="coerce")
-    if not snaps.empty:
-        snaps["snapshot_date"] = pd.to_datetime(snaps["snapshot_date"])
-    return works, snaps
-
-
-def enrich_latest(snaps: pd.DataFrame, min_age: int, max_age: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp, str]:
-    latest_date = snaps["snapshot_date"].max()
-    latest = snaps[snaps["snapshot_date"] == latest_date].copy()
-    start, end = publication_window(dt.date.today(), min_age, max_age)
-    latest = latest[(latest["publication_date"] >= pd.to_datetime(start)) & (latest["publication_date"] <= pd.to_datetime(end))].copy()
-    snaps2 = snaps[snaps["openalex_id"].isin(latest["openalex_id"])]
-    if latest.empty:
-        return latest, snaps2, latest_date, f"{start} to {end}"
-
-    pivot = snaps2.pivot_table(index="openalex_id", columns="snapshot_date", values="cited_by_count", aggfunc="max")
-    all_dates = sorted(snaps2["snapshot_date"].unique())
-
-    def delta_since(days: int) -> pd.Series:
-        target = latest_date - pd.Timedelta(days=days)
-        prior_dates = [d for d in all_dates if d <= target]
-        if not prior_dates or latest_date not in pivot.columns:
-            return pd.Series(0, index=pivot.index)
-        prior = max(prior_dates)
-        return (pivot[latest_date] - pivot[prior]).fillna(0).astype(int)
-
-    latest = latest.set_index("openalex_id")
-    latest["gain_7d"] = delta_since(7)
-    latest["gain_30d"] = delta_since(30)
-    latest["gain_90d"] = delta_since(90)
-    latest = latest.reset_index()
-    latest["months_since_publication"] = ((latest_date - latest["publication_date"]).dt.days / 30.44).clip(lower=0).round(1)
-    latest["citations_per_month"] = (latest["cited_by_count"] / latest["months_since_publication"].clip(lower=0.25)).round(2)
-    latest["themes"] = latest.apply(tag_themes, axis=1)
-    latest["theme"] = latest["themes"].apply(lambda x: "; ".join(x))
-    as_of = latest_date.date() if hasattr(latest_date, "date") else dt.date.today()
-    latest["citations_365d"] = latest.apply(lambda r: last_365_citations(r, as_of), axis=1)
-    latest["first_12m_citations"] = latest.apply(first_12m_citations, axis=1)
-    latest["citation_momentum_index"] = (latest["citations_365d"] / latest["cited_by_count"].replace(0, pd.NA)).fillna(0).round(2)
-    return latest, snaps2, latest_date, f"{start} to {end}"
-
-
-def explode_themes(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    return df.explode("themes").rename(columns={"themes": "theme_tag"})
-
-
-def prep_table(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "publication_date" in out:
-        out["publication_date"] = pd.to_datetime(out["publication_date"]).dt.date.astype(str)
-    return out
-
-
-def chart_layout(fig: go.Figure) -> go.Figure:
-    fig.update_layout(
-        template="plotly_white",
-        colorway=PLOTLY_COLORS,
-        font=dict(family="Arial", color="#101828"),
-        margin=dict(l=10, r=10, t=35, b=10),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        legend=dict(orientation="v"),
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="#EDF1F7")
-    fig.update_yaxes(showgrid=True, gridcolor="#EDF1F7")
-    return fig
-
-
-def metric_row_12_36(latest: pd.DataFrame) -> None:
-    top = latest.sort_values("citations_365d", ascending=False).head(1)
-    top_title = "—" if top.empty else re.sub(r"\s+", " ", str(top.iloc[0]["title"]))[:62]
-    top_value = 0 if top.empty else int(top.iloc[0]["citations_365d"])
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Papers published (12-36 months)", f"{latest['openalex_id'].nunique():,}")
-    c2.metric("Lifetime citations", f"{int(latest['cited_by_count'].sum()):,}")
-    c3.metric("Citations in last 365 days", f"{int(latest['citations_365d'].sum()):,}")
-    c4.metric("Mean citations in last 365 days per paper", f"{latest['citations_365d'].mean():.1f}")
-    c5.metric("Most cited paper (last 365 days)", f"{top_value:,}", delta=top_title)
-    c6.metric("Median citations in last 365 days", f"{latest['citations_365d'].median():.0f}")
-
-
-def citation_performance(snaps: pd.DataFrame) -> None:
-    latest, snaps2, latest_date, cohort = enrich_latest(snaps, 12, 36)
-    page_header("Citation Performance (12–36 Month Cohort)", "Papers published between 12 and 36 months ago", cohort, latest_date.date().isoformat())
-    if latest.empty:
-        st.warning("No papers found in the 12–36 month window. Use the sidebar to fetch data.")
-        return
-    metric_row_12_36(latest)
-
-    col1, col2, col3, col4 = st.columns([1.25, 1, 1.15, 1.15])
-    with col1:
-        section_title("Citations in last 365 days over time")
-        monthly = snaps2.copy()
-        monthly["month"] = monthly["snapshot_date"].dt.to_period("M").dt.to_timestamp()
-        monthly = monthly.groupby("month", as_index=False)["cited_by_count"].sum().sort_values("month")
-        monthly["monthly_gain"] = monthly["cited_by_count"].diff().fillna(0).clip(lower=0)
-        fig = px.line(monthly.tail(13), x="month", y="monthly_gain", markers=True)
-        fig.update_traces(line_color=ERJ_RED, marker_color=ERJ_RED)
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-    with col2:
-        section_title("Distribution of citations (365d)")
-        fig = px.histogram(latest, x="citations_365d", nbins=24)
-        fig.update_traces(marker_color=ERJ_BLUE)
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-    with col3:
-        section_title("Top themes by citations (365d)")
-        th = explode_themes(latest).groupby("theme_tag", as_index=False).agg(citations_365d=("citations_365d", "sum"), papers=("openalex_id", "nunique"))
-        th = th.sort_values("citations_365d", ascending=False).head(8)
-        fig = px.bar(th, x="citations_365d", y="theme_tag", orientation="h", hover_data=["papers"])
-        fig.update_traces(marker_color=ERJ_BLUE)
-        fig.update_layout(yaxis={"categoryorder":"total ascending"})
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-    with col4:
-        section_title("Article types by citations (365d)")
-        ty = latest.groupby("article_type", as_index=False).agg(citations_365d=("citations_365d", "sum"), papers=("openalex_id", "nunique"))
-        fig = px.pie(ty, values="citations_365d", names="article_type", hole=.55, color_discrete_sequence=PLOTLY_COLORS)
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-
-    left, right = st.columns([1.45, 1])
-    with left:
-        section_title("Top 25 papers by citations in last 365 days")
-        top25 = latest.sort_values(["citations_365d", "cited_by_count"], ascending=False).head(25)
-        cols = ["title", "first_author", "theme", "article_type", "publication_date", "citations_365d", "cited_by_count", "doi", "landing_page_url"]
-        st.dataframe(prep_table(top25[cols]), use_container_width=True, hide_index=True)
-        st.download_button("Download top 25 CSV", prep_table(top25[cols]).to_csv(index=False), "erjor_top25_citations_365d.csv", "text/csv")
-    with right:
-        section_title("Lifetime citations vs citations in last 365 days")
-        fig = px.scatter(latest, x="cited_by_count", y="citations_365d", hover_name="title", hover_data=["first_author", "article_type"], )
-        fig.update_traces(marker=dict(color=ERJ_BLUE, size=8, opacity=.78))
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-
-    st.caption("Citations in the last 365 days are estimated from OpenAlex counts_by_year for citing works. Lifetime citations use OpenAlex cited_by_count and may differ from Google Scholar.")
-
-
-def new_papers(snaps: pd.DataFrame) -> None:
-    latest, _, latest_date, cohort = enrich_latest(snaps, 0, 12)
-    page_header("New Papers (0–12 Months)", "Theme, article type and early citation traction", cohort, latest_date.date().isoformat())
-    if latest.empty:
-        st.warning("No papers found in the last 12 months.")
-        return
-    regularly = latest[(latest["cited_by_count"] >= 3) | (latest["citations_per_month"] >= 0.5)].copy()
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Total papers", f"{latest['openalex_id'].nunique():,}")
-    c2.metric("Original research", f"{latest['article_type'].str.contains('Original', case=False, na=False).sum():,}")
-    c3.metric("Reviews", f"{latest['article_type'].str.contains('Review', case=False, na=False).sum():,}")
-    c4.metric("Clinical research", f"{explode_themes(latest).query('theme_tag == " + '"Clinical research"' + "')['openalex_id'].nunique():,}")
-    c5.metric("Basic science", f"{explode_themes(latest).query('theme_tag == " + '"Basic science"' + "')['openalex_id'].nunique():,}")
-    c6.metric("Cited regularly", f"{regularly['openalex_id'].nunique():,}")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        section_title("Article type breakdown")
-        type_df = latest.groupby("article_type", as_index=False).agg(papers=("openalex_id", "nunique"), citations=("cited_by_count", "sum"))
-        fig = px.bar(type_df.sort_values("papers", ascending=False), x="article_type", y="papers", hover_data=["citations"])
-        fig.update_traces(marker_color=ERJ_BLUE)
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-        st.dataframe(type_df.sort_values("papers", ascending=False), use_container_width=True, hide_index=True)
-    with col2:
-        section_title("Theme breakdown", "Papers can have more than one theme")
-        th = explode_themes(latest).groupby("theme_tag", as_index=False).agg(papers=("openalex_id", "nunique"), citations=("cited_by_count", "sum"))
-        th = th.sort_values(["papers", "citations"], ascending=False)
-        fig = px.bar(th.head(18), x="papers", y="theme_tag", orientation="h", hover_data=["citations"])
-        fig.update_traces(marker_color=ERJ_RED)
-        fig.update_layout(yaxis={"categoryorder":"total ascending"})
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-        st.dataframe(th, use_container_width=True, hide_index=True)
-
-    section_title("Recent papers already gaining citation traction")
-    cols = ["title", "first_author", "article_type", "theme", "publication_date", "months_since_publication", "cited_by_count", "citations_per_month", "doi", "landing_page_url"]
-    st.dataframe(prep_table(latest.sort_values(["citations_per_month", "cited_by_count"], ascending=False)[cols]), use_container_width=True, hide_index=True)
-
-
-def topic_momentum(snaps: pd.DataFrame) -> None:
-    latest, _, latest_date, cohort = enrich_latest(snaps, 12, 36)
-    page_header("Topic Momentum", "Which topics are generating current citation impact?", cohort, latest_date.date().isoformat())
-    if latest.empty:
-        st.warning("No papers found.")
-        return
-    th = explode_themes(latest)
-    stats = th.groupby("theme_tag", as_index=False).agg(
-        papers=("openalex_id", "nunique"),
-        citations_365d=("citations_365d", "sum"),
-        lifetime_citations=("cited_by_count", "sum"),
-        mean_365d=("citations_365d", "mean"),
-        median_365d=("citations_365d", "median"),
-        gain_30d=("gain_30d", "sum"),
-        gain_90d=("gain_90d", "sum"),
-    )
-    stats["citations_365d_per_paper"] = (stats["citations_365d"] / stats["papers"]).round(2)
-    stats["momentum"] = (stats["citations_365d_per_paper"] + stats["gain_90d"] / stats["papers"].clip(lower=1)).round(2)
-    stats = stats.sort_values(["momentum", "citations_365d"], ascending=False)
-
-    col1, col2 = st.columns([1.2, 1])
-    with col1:
-        section_title("Theme momentum table")
-        st.dataframe(stats, use_container_width=True, hide_index=True)
-    with col2:
-        section_title("Momentum bubble chart")
-        fig = px.scatter(stats, x="papers", y="citations_365d_per_paper", size="citations_365d", color="theme_tag", hover_name="theme_tag", color_discrete_sequence=PLOTLY_COLORS)
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-
-    section_title("Top paper within each theme")
-    top_by_theme = th.sort_values(["citations_365d", "cited_by_count"], ascending=False).groupby("theme_tag", as_index=False).head(1)
-    cols = ["theme_tag", "title", "first_author", "publication_date", "citations_365d", "cited_by_count", "article_type", "doi"]
-    st.dataframe(prep_table(top_by_theme[cols]), use_container_width=True, hide_index=True)
-
-
-def editorial_intelligence(snaps: pd.DataFrame) -> None:
-    cohort, _, latest_date, cohort_text = enrich_latest(snaps, 12, 36)
-    recent, _, _, recent_text = enrich_latest(snaps, 0, 12)
-    page_header("Editorial Intelligence", "Editor's Radar: papers and topics to act on", cohort_text, latest_date.date().isoformat())
-    if cohort.empty and recent.empty:
-        st.warning("No papers available.")
-        return
-    col1, col2 = st.columns(2)
-    with col1:
-        section_title("Rising stars", "12–36m papers with highest citations in the last 365 days")
-        cols = ["title", "first_author", "theme", "publication_date", "citations_365d", "cited_by_count", "citation_momentum_index"]
-        st.dataframe(prep_table(cohort.sort_values(["citations_365d", "citation_momentum_index"], ascending=False).head(12)[cols]), use_container_width=True, hide_index=True)
-    with col2:
-        section_title("High-potential new papers", "0–12m papers already cited or cited per month")
-        cols = ["title", "first_author", "theme", "publication_date", "cited_by_count", "citations_per_month"]
-        st.dataframe(prep_table(recent.sort_values(["citations_per_month", "cited_by_count"], ascending=False).head(12)[cols]), use_container_width=True, hide_index=True)
-
-    col3, col4 = st.columns(2)
-    with col3:
-        section_title("Hidden gems", "Lower lifetime citations but high recent share")
-        gems = cohort[(cohort["cited_by_count"] >= 1)].sort_values(["citation_momentum_index", "citations_365d"], ascending=False).head(12)
-        cols = ["title", "first_author", "theme", "citations_365d", "cited_by_count", "citation_momentum_index"]
-        st.dataframe(gems[cols], use_container_width=True, hide_index=True)
-    with col4:
-        section_title("Commissioning opportunities", "Themes with strongest recent citations per paper")
-        th = explode_themes(cohort).groupby("theme_tag", as_index=False).agg(papers=("openalex_id", "nunique"), citations_365d=("citations_365d", "sum"))
-        th["citations_365d_per_paper"] = (th["citations_365d"] / th["papers"].clip(lower=1)).round(2)
-        th = th.sort_values(["citations_365d_per_paper", "papers"], ascending=False).head(12)
-        st.dataframe(th, use_container_width=True, hide_index=True)
-
-
-
-EXCLUDED_CITABLE_PATTERNS = [
-    "editorial", "letter", "correspondence", "research letter", "reply", "response to",
-    "correction", "erratum", "corrigendum", "retraction", "news", "obituary", "commentary",
-]
-INCLUDED_CITABLE_PATTERNS = [
-    "original research", "research article", "article", "review", "systematic review", "meta-analysis", "meta analysis",
-    "methods", "clinical trial",
-]
-
-
-def citable_decision(row: pd.Series) -> tuple[bool, str]:
-    """Estimate whether a work should be counted in the Impact Factor denominator.
-
-    This is an OpenAlex/Crossref-based approximation of the Web of Science citable-item
-    denominator. It intentionally excludes editorials, letters, correspondence and
-    research letters where the metadata or title suggests those article types.
-    """
-    title = str(row.get("title") or "").strip().lower()
-    article_type = str(row.get("article_type") or "").strip().lower()
-    work_type = str(row.get("work_type") or "").strip().lower()
-    text = f" {title} {article_type} {work_type} "
-
-    for term in EXCLUDED_CITABLE_PATTERNS:
-        if term in text or title.startswith(term + ":") or title.startswith(term + " "):
-            return False, f"Excluded: {term}"
-
-    if "review" in article_type or "review" in work_type or "systematic review" in title or "meta-analysis" in title or "meta analysis" in title:
-        return True, "Included: review"
-    if "original" in article_type or "article" in work_type or "journal-article" in work_type:
-        return True, "Included: article/research"
-
-    for term in INCLUDED_CITABLE_PATTERNS:
-        if term in text:
-            return True, f"Included: {term}"
-    return False, "Excluded: ambiguous/non-citable"
-
-
-def add_citable_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if out.empty:
-        out["is_citable"] = []
-        out["citable_reason"] = []
-        return out
-    decisions = out.apply(citable_decision, axis=1)
-    out["is_citable"] = decisions.apply(lambda x: x[0])
-    out["citable_reason"] = decisions.apply(lambda x: x[1])
-    return out
-
-
-def latest_all_works(snaps: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp]:
-    latest_date = snaps["snapshot_date"].max()
-    latest = snaps[snaps["snapshot_date"] == latest_date].copy()
-    latest["themes"] = latest.apply(tag_themes, axis=1)
-    latest["theme"] = latest["themes"].apply(lambda x: "; ".join(x))
-    return latest, latest_date
-
-
-def eif_for_year(df: pd.DataFrame, year: int) -> tuple[pd.DataFrame, pd.DataFrame, int, float]:
-    start_pub = pd.Timestamp(year=year-2, month=1, day=1)
-    end_pub = pd.Timestamp(year=year-1, month=12, day=31)
-    window = df[(df["publication_date"] >= start_pub) & (df["publication_date"] <= end_pub)].copy()
-    window = add_citable_columns(window)
-    citable = window[window["is_citable"]].copy()
-    y0 = dt.date(year, 1, 1)
-    y1 = dt.date(year + 1, 1, 1)
-    citable["jif_year_citations"] = citable.apply(lambda r: citation_count_between(r, y0, y1), axis=1)
-    numerator = int(citable["jif_year_citations"].sum()) if not citable.empty else 0
-    denominator = int(citable["openalex_id"].nunique()) if not citable.empty else 0
-    eif = numerator / denominator if denominator else 0.0
-    return window, citable, numerator, eif
-
-
-
-def cumulative_if_citations(citable: pd.DataFrame, year: int, freq: str = "Monthly", as_of: dt.date | None = None) -> pd.DataFrame:
-    """Build cumulative IF numerator citations through a calendar year.
-
-    Values are estimated from OpenAlex counts_by_year by prorating annual citation
-    buckets across months or ISO-style weeks. This keeps the tracker lightweight
-    for Streamlit Cloud. Exact daily/monthly curves would require fetching every
-    individual citing work and using each citing publication date.
-    """
-    if as_of is None:
-        as_of = dt.date.today()
-    start = dt.date(year, 1, 1)
-    end_exclusive = dt.date(year + 1, 1, 1)
-    if freq == "Weekly":
-        dates = pd.date_range(start, end_exclusive - dt.timedelta(days=1), freq="W-SUN")
-        if len(dates) == 0 or dates[-1].date() < end_exclusive - dt.timedelta(days=1):
-            dates = dates.append(pd.DatetimeIndex([pd.Timestamp(end_exclusive - dt.timedelta(days=1))]))
-        period_label = [f"W{d.isocalendar().week:02d}" for d in dates]
-        x_value = list(range(1, len(dates) + 1))
-    else:
-        dates = pd.date_range(start, end_exclusive - dt.timedelta(days=1), freq="ME")
-        period_label = [d.strftime("%b") for d in dates]
-        x_value = list(range(1, len(dates) + 1))
-
-    rows = []
-    for idx, d in enumerate(dates):
-        end_date = d.date() + dt.timedelta(days=1)
-        if year == as_of.year and d.date() > as_of:
-            # Keep the axis to Dec but do not project future cumulative points as actuals.
-            value = None
-        else:
-            capped_end = min(end_date, as_of + dt.timedelta(days=1)) if year == as_of.year else end_date
-            value = int(citable.apply(lambda r: citation_count_between(r, start, capped_end), axis=1).sum()) if not citable.empty else 0
-        rows.append({
-            "year": year,
-            "period_index": x_value[idx],
-            "period": period_label[idx],
-            "date": d.date().isoformat(),
-            "cumulative_citations": value,
-        })
-    return pd.DataFrame(rows)
-
-
-
-def year_to_date_page(snaps: pd.DataFrame) -> None:
-    latest, latest_date = latest_all_works(snaps)
-    current_year = dt.date.today().year
-    years = sorted([int(y) for y in latest["publication_year"].dropna().astype(int).unique()], reverse=True)
-    if not years:
-        years = [current_year]
-    default_index = years.index(current_year) if current_year in years else 0
-
-    page_header(
-        "Year-to-Date Publishing Tracker",
-        "Publication mix, citable-item profile and topic breakdown for ERJ Open Research",
-        "Calendar-year publications; citable status is estimated from OpenAlex/Crossref metadata",
-        latest_date.date().isoformat(),
-    )
-
-    col_a, col_b, col_c = st.columns([1, 1, 2])
-    selected_year = col_a.selectbox("Primary year", years, index=default_index)
-    compare_years = col_b.multiselect(
-        "Compare with years",
-        [y for y in years if y != selected_year],
-        default=[y for y in [selected_year - 1, selected_year - 2] if y in years],
-    )
-    all_selected_years = [selected_year] + compare_years
-    st.caption("Use the comparison controls to compare total output, citable/non-citable mix, article types and topics between years.")
-
-    ytd = latest[latest["publication_year"].isin(all_selected_years)].copy()
-    if ytd.empty:
-        st.warning("No publications found for the selected year(s). Use the sidebar to fetch/update OpenAlex data.")
-        return
-    ytd = add_citable_columns(ytd)
-    ytd["publication_month"] = ytd["publication_date"].dt.month
-    ytd["year"] = ytd["publication_year"].astype(int)
-    ytd["citable_status"] = ytd["is_citable"].map({True: "Citable", False: "Non-citable"})
-
-    primary = ytd[ytd["year"] == selected_year].copy()
-    total_published = int(primary["openalex_id"].nunique())
-    citable_count = int(primary.loc[primary["is_citable"], "openalex_id"].nunique())
-    non_citable_count = max(total_published - citable_count, 0)
-    citable_pct = (100 * citable_count / total_published) if total_published else 0
-    top_type = "—" if primary.empty else str(primary["article_type"].fillna("Unknown").value_counts().idxmax())
-    top_topic = "—"
-    if not primary.empty:
-        tmp = explode_themes(primary)
-        if not tmp.empty:
-            vc = tmp["theme_tag"].dropna().value_counts()
-            if not vc.empty:
-                top_topic = str(vc.idxmax())
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric(f"Total published {selected_year}", f"{total_published:,}")
-    c2.metric("Citable items", f"{citable_count:,}", delta=f"{citable_pct:.0f}% of total")
-    c3.metric("Non-citable items", f"{non_citable_count:,}")
-    c4.metric("Most common type", top_type)
-    c5.metric("Top topic/theme", top_topic)
-
-    section_title("Year-on-year publication volume", "Cumulative published items by month for selected years")
-    monthly = ytd.groupby(["year", "publication_month"], as_index=False).agg(papers=("openalex_id", "nunique"))
-    full = []
-    for year in all_selected_years:
-        base = pd.DataFrame({"publication_month": list(range(1, 13))})
-        base["year"] = year
-        merged = base.merge(monthly[monthly["year"] == year], on=["year", "publication_month"], how="left").fillna({"papers": 0})
-        merged["cumulative_papers"] = merged["papers"].cumsum()
-        full.append(merged)
-    cumulative = pd.concat(full, ignore_index=True)
-    cumulative["month_label"] = cumulative["publication_month"].apply(lambda m: dt.date(2000, int(m), 1).strftime("%b"))
-    fig = px.line(cumulative, x="publication_month", y="cumulative_papers", color="year", markers=True, hover_data=["month_label", "papers"])
-    fig.update_xaxes(tickmode="array", tickvals=list(range(1, 13)), ticktext=[dt.date(2000, m, 1).strftime("%b") for m in range(1, 13)], title="Month")
-    fig.update_yaxes(title="Cumulative publications")
-    st.plotly_chart(chart_layout(fig), use_container_width=True)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        section_title("Citable vs non-citable", "Estimated denominator status for each selected year")
-        status = ytd.groupby(["year", "citable_status"], as_index=False).agg(papers=("openalex_id", "nunique"))
-        fig = px.bar(status, x="year", y="papers", color="citable_status", barmode="stack", color_discrete_map={"Citable": ERJ_BLUE, "Non-citable": ERJ_RED})
-        fig.update_xaxes(type="category", title="Year")
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-    with col2:
-        section_title("Article type breakdown", "Original, review, editorial, letter/correspondence and other types")
-        types = ytd.groupby(["year", "article_type"], as_index=False).agg(papers=("openalex_id", "nunique"))
-        fig = px.bar(types, x="year", y="papers", color="article_type", barmode="stack", color_discrete_sequence=PLOTLY_COLORS)
-        fig.update_xaxes(type="category", title="Year")
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-
-    col3, col4 = st.columns([1.15, 1])
-    with col3:
-        section_title("Topic breakdown", "Papers can have multiple topic/theme tags")
-        themes = explode_themes(ytd)
-        if themes.empty:
-            st.info("No theme tags available yet.")
-        else:
-            theme_counts = themes.groupby(["year", "theme_tag"], as_index=False).agg(papers=("openalex_id", "nunique"))
-            top_theme_names = theme_counts.groupby("theme_tag")["papers"].sum().sort_values(ascending=False).head(16).index.tolist()
-            theme_counts = theme_counts[theme_counts["theme_tag"].isin(top_theme_names)]
-            fig = px.bar(theme_counts, x="papers", y="theme_tag", color="year", orientation="h", barmode="group", color_discrete_sequence=PLOTLY_COLORS)
-            fig.update_layout(yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(chart_layout(fig), use_container_width=True)
-    with col4:
-        section_title("Year summary table")
-        summary = ytd.groupby("year", as_index=False).agg(
-            total_published=("openalex_id", "nunique"),
-            citable_items=("is_citable", "sum"),
-            lifetime_citations=("cited_by_count", "sum"),
-        )
-        summary["non_citable_items"] = summary["total_published"] - summary["citable_items"]
-        summary["citable_%"] = (100 * summary["citable_items"] / summary["total_published"].clip(lower=1)).round(1)
-        st.dataframe(summary.sort_values("year", ascending=False), use_container_width=True, hide_index=True)
-
-    section_title("Publication audit", "All selected-year publications with estimated citable status and reason")
-    audit_cols = ["year", "title", "first_author", "publication_date", "article_type", "is_citable", "citable_reason", "theme", "cited_by_count", "doi", "landing_page_url"]
-    audit = prep_table(ytd[audit_cols].sort_values(["year", "publication_date"], ascending=[False, False]))
-    st.dataframe(audit, use_container_width=True, hide_index=True)
-    st.download_button("Download year-to-date audit CSV", audit.to_csv(index=False), f"erjor_ytd_publication_audit_{selected_year}.csv", "text/csv")
-
-
-def impact_factor_page(snaps: pd.DataFrame) -> None:
-    latest, latest_date = latest_all_works(snaps)
-    default_year = dt.date.today().year
-    page_header(
-        "Estimated Impact Factor",
-        "OpenAlex-based live estimate using a Web of Science-style two-year citation window",
-        f"JIF denominator window updates with selected year",
-        latest_date.date().isoformat(),
-    )
-    st.info(
-        "This is an **estimate**, not the official Clarivate Journal Impact Factor. "
-        "The denominator excludes editorials, letters, correspondence, research letters, corrections and similar items where identifiable."
-    )
-
-    available_years = sorted(set(int(y) for y in latest["publication_year"].dropna().astype(int).unique()))
-    min_year = max(min(available_years) + 2, default_year - 4) if available_years else default_year
-    year_options = list(range(min_year, default_year + 1))
-    selected_year = st.selectbox("Impact Factor year", year_options[::-1], index=0)
-
-    window, citable, numerator, eif = eif_for_year(latest, int(selected_year))
-    denominator = int(citable["openalex_id"].nunique()) if not citable.empty else 0
-    excluded_count = int(window[~window.get("is_citable", False)].openalex_id.nunique()) if not window.empty and "is_citable" in window else 0
-    today = dt.date.today()
-    days_elapsed = (today - dt.date(selected_year, 1, 1)).days + 1 if selected_year == today.year else 365
-    days_in_year = 366 if dt.date(selected_year, 12, 31).timetuple().tm_yday == 366 else 365
-    projected_numerator = int(round(numerator * days_in_year / max(days_elapsed, 1))) if selected_year == today.year else numerator
-    projected_eif = projected_numerator / denominator if denominator else 0.0
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Estimated IF", f"{eif:.2f}")
-    c2.metric("Projected year-end IF", f"{projected_eif:.2f}")
-    c3.metric("Citations in IF year", f"{numerator:,}")
-    c4.metric("Citable items", f"{denominator:,}")
-    c5.metric("Excluded items", f"{excluded_count:,}")
-    c6.metric("Publication window", f"{selected_year-2}–{selected_year-1}")
-
-    section_title(
-        "Cumulative IF citation tracker",
-        f"Cumulative citations during {selected_year} to citable ERJOR papers published {selected_year-2}–{selected_year-1}, with the three previous IF years faded for comparison."
-    )
-    tracker_freq = st.radio("Tracker granularity", ["Monthly", "Weekly"], horizontal=True, key="if_tracker_frequency")
-
-    comparison_years = [int(selected_year) - i for i in range(4)]
-    curves = []
-    for y in comparison_years:
-        _, y_citable, _, _ = eif_for_year(latest, y)
-        curve = cumulative_if_citations(y_citable, y, tracker_freq)
-        curve["series"] = curve["year"].astype(str)
-        curves.append(curve)
-    tracker = pd.concat(curves, ignore_index=True) if curves else pd.DataFrame()
-
-    fig_tracker = go.Figure()
-    series_styles = {
-        int(selected_year): {"color": ERJ_RED, "opacity": 1.0, "width": 4},
-        int(selected_year) - 1: {"color": ERJ_BLUE, "opacity": 0.58, "width": 3},
-        int(selected_year) - 2: {"color": ERJ_TEAL, "opacity": 0.38, "width": 2.5},
-        int(selected_year) - 3: {"color": ERJ_GREY, "opacity": 0.28, "width": 2.5},
-    }
-    for y in comparison_years:
-        d = tracker[tracker["year"] == y].copy()
-        if d.empty:
-            continue
-        style = series_styles.get(y, {"color": ERJ_GREY, "opacity": 0.35, "width": 2})
-        fig_tracker.add_trace(go.Scatter(
-            x=d["period_index"],
-            y=d["cumulative_citations"],
-            mode="lines+markers",
-            name=str(y),
-            line=dict(color=style["color"], width=style["width"]),
-            marker=dict(color=style["color"], size=7),
-            opacity=style["opacity"],
-            customdata=d[["period", "date"]],
-            hovertemplate="IF year %{fullData.name}<br>%{customdata[0]} (%{customdata[1]})<br>Cumulative citations: %{y}<extra></extra>",
-            connectgaps=False,
-        ))
-
-    tick_df = tracker[tracker["year"] == int(selected_year)].drop_duplicates("period_index") if not tracker.empty else pd.DataFrame()
-    if not tick_df.empty:
-        fig_tracker.update_xaxes(
-            tickmode="array",
-            tickvals=tick_df["period_index"].tolist(),
-            ticktext=tick_df["period"].tolist(),
-            title="Month" if tracker_freq == "Monthly" else "Week",
-        )
-    fig_tracker.update_yaxes(title="Cumulative citations")
-    fig_tracker.update_layout(legend_title_text="IF year")
-    st.plotly_chart(chart_layout(fig_tracker), use_container_width=True)
-    st.caption(
-        "Tracker values are OpenAlex-based estimates. Older comparison years are deliberately faded. The app prorates OpenAlex annual citation buckets across months/weeks; exact month-by-month values would require fetching every individual citing paper and its publication date."
-    )
-
-    col1, col2 = st.columns([1.15, 1])
-    with col1:
-        section_title("Estimated IF by year", "OpenAlex-based annual estimates where data are available")
-        rows = []
-        for y in year_options:
-            w, c, n, val = eif_for_year(latest, y)
-            rows.append({
-                "year": y,
-                "estimated_if": round(val, 3),
-                "citations_to_previous_2y": n,
-                "citable_items": int(c["openalex_id"].nunique()) if not c.empty else 0,
-                "publication_window": f"{y-2}-{y-1}",
-            })
-        hist = pd.DataFrame(rows)
-        fig = px.line(hist, x="year", y="estimated_if", markers=True, hover_data=["citations_to_previous_2y", "citable_items", "publication_window"])
-        fig.update_traces(line_color=ERJ_RED)
-        st.plotly_chart(chart_layout(fig), use_container_width=True)
-        st.dataframe(hist.sort_values("year", ascending=False), use_container_width=True, hide_index=True)
-    with col2:
-        section_title("Numerator contributors", "Papers driving the estimated Impact Factor")
-        if citable.empty:
-            st.warning("No citable items found for this denominator window.")
-        else:
-            top = citable.sort_values("jif_year_citations", ascending=False).head(15)
-            fig = px.bar(top, x="jif_year_citations", y="title", orientation="h", hover_data=["first_author", "article_type", "publication_date"])
-            fig.update_traces(marker_color=ERJ_BLUE)
-            fig.update_layout(yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(chart_layout(fig), use_container_width=True)
-
-    section_title("Citable items audit", "Review inclusion/exclusion decisions for the denominator")
-    if window.empty:
-        st.warning("No works found in the selected two-year publication window. Fetching a wider OpenAlex window may be needed.")
-    else:
-        audit = window.copy()
-        if "jif_year_citations" not in audit:
-            audit["jif_year_citations"] = audit.apply(lambda r: citation_count_between(r, dt.date(selected_year, 1, 1), dt.date(selected_year + 1, 1, 1)), axis=1)
-        audit = prep_table(audit[[
-            "title", "first_author", "publication_date", "article_type", "work_type",
-            "is_citable", "citable_reason", "jif_year_citations", "cited_by_count", "doi", "landing_page_url"
-        ]].sort_values(["is_citable", "jif_year_citations"], ascending=[False, False]))
-        st.dataframe(audit, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download citable items audit CSV",
-            audit.to_csv(index=False),
-            f"erjor_estimated_if_{selected_year}_audit.csv",
-            "text/csv",
-        )
-
-    section_title("What-if calculator")
-    wc1, wc2, wc3 = st.columns(3)
-    extra_citations = wc1.number_input("Extra citations in IF year", min_value=0, value=0, step=1)
-    add_items = wc2.number_input("Additional citable items", min_value=0, value=0, step=1)
-    remove_items = wc3.number_input("Citable items to exclude", min_value=0, value=0, step=1)
-    adjusted_denominator = max(denominator + int(add_items) - int(remove_items), 1)
-    adjusted_eif = (numerator + int(extra_citations)) / adjusted_denominator
-    st.metric("Adjusted estimated IF", f"{adjusted_eif:.2f}", delta=f"{adjusted_eif - eif:+.2f} vs current estimate")
-
-def report_page(snaps: pd.DataFrame) -> None:
-    latest, _, latest_date, cohort = enrich_latest(snaps, 12, 36)
-    page_header("Editorial Board Report", "One-page exportable summary", cohort, latest_date.date().isoformat())
-    if latest.empty:
-        st.warning("No papers found.")
-        return
-    metric_row_12_36(latest)
-    st.divider()
-    col1, col2 = st.columns(2)
-    with col1:
-        section_title("Top 5 papers")
-        st.dataframe(prep_table(latest.sort_values("citations_365d", ascending=False).head(5)[["title", "first_author", "citations_365d", "cited_by_count", "theme"]]), use_container_width=True, hide_index=True)
-    with col2:
-        section_title("Top 5 themes")
-        th = explode_themes(latest).groupby("theme_tag", as_index=False).agg(papers=("openalex_id", "nunique"), citations_365d=("citations_365d", "sum"))
-        th["citations_365d_per_paper"] = (th["citations_365d"] / th["papers"].clip(lower=1)).round(2)
-        st.dataframe(th.sort_values("citations_365d", ascending=False).head(5), use_container_width=True, hide_index=True)
-    export = prep_table(latest.sort_values("citations_365d", ascending=False))
-    st.download_button("Download full report data CSV", export.to_csv(index=False), "erjor_editorial_report_data.csv", "text/csv")
-    st.caption("Use your browser's print command to save this page as PDF for now. A dedicated PDF export can be added later.")
-
-
-# -----------------------------
-# Decision tracker helpers
-# -----------------------------
-DECISION_FILE = Path("decision_records.csv")
-
-DECISION_TYPE_PATTERNS = [
-    "Original Research Article", "Research Letter", "Systematic Review", "Review", "Protocol",
-    "Correspondence", "Editorial", "Letter", "Perspective", "Commentary", "Case Report"
-]
-
-def parse_scholarone_date(value: str | None) -> pd.Timestamp:
-    if not value:
-        return pd.NaT
-    return pd.to_datetime(value, errors="coerce", dayfirst=True)
-
-def detect_decision(raw: str) -> str:
-    txt = raw.lower()
-    if "desk reject" in txt:
-        return "Desk Reject"
-    if re.search(r"\breject(?:ed)?\b", txt):
-        return "Reject"
-    if re.search(r"\baccept(?:ed)?\b", txt):
-        return "Accept"
-    if "revise" in txt or "revision" in txt:
-        return "Revision"
-    return "Other"
-
-def detect_study_type(raw: str) -> str:
-    lower = raw.lower()
-    aliases = {
-        "original research article": "Original Research Article",
-        "research letter": "Research Letter",
-        "systematic review": "Systematic Review",
-        "meta-analysis": "Review",
-        "meta analysis": "Review",
-        "review": "Review",
-        "protocol": "Protocol",
-        "correspondence": "Correspondence",
-        "editorial": "Editorial",
-        "letter": "Letter",
-        "perspective": "Perspective",
-        "commentary": "Commentary",
-        "case report": "Case Report",
-    }
-    for key, label in aliases.items():
-        if key in lower:
-            return label
-    return "Unclassified"
-
-def extract_title_from_raw(raw: str, study_type: str) -> str:
-    text = re.sub(r"\s+", " ", str(raw)).strip()
-    m = re.search(r"In Review:\s*[^A-Z]*(.*)", text)
-    body = m.group(1).strip() if m else text
-    if study_type and study_type != "Unclassified":
-        idx = body.lower().find(study_type.lower())
-        if idx > 0:
-            body = body[:idx].strip()
-    # Remove author tail heuristically: title is before the first "Surname, Firstname" pattern after at least a few words.
-    auth = re.search(r"\s+[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'\-]+,\s+[A-ZÀ-ÖØ-Þ]", body)
-    if auth and auth.start() > 20:
-        body = body[:auth.start()].strip()
-    return body[:240]
-
-def parse_decision_text(text: str) -> dict:
-    raw = re.sub(r"\s+", " ", str(text)).strip()
-    mid = re.search(r"\b(ERJOR-\d{5}-\d{4}(?:\.R\d+)?)\b", raw)
-    submitted = re.search(r"Submitted:\s*([^;]+)", raw)
-    updated = re.search(r"Last Updated:\s*([^;]+)", raw)
-    study_type = detect_study_type(raw)
-    submitted_date = parse_scholarone_date(submitted.group(1).strip() if submitted else None)
-    decision_date = parse_scholarone_date(updated.group(1).strip() if updated else None)
-    decision = detect_decision(raw)
-    title = extract_title_from_raw(raw, study_type)
-    themes = assign_themes(title + " " + raw)
-    days_to_decision = None
-    if pd.notna(submitted_date) and pd.notna(decision_date):
-        days_to_decision = max(int((decision_date.date() - submitted_date.date()).days), 0)
-    return {
-        "manuscript_id": mid.group(1) if mid else "",
-        "title": title,
-        "submitted_date": submitted_date.date().isoformat() if pd.notna(submitted_date) else "",
-        "decision_date": decision_date.date().isoformat() if pd.notna(decision_date) else "",
-        "study_type": study_type,
-        "decision": decision,
-        "themes": "; ".join(themes),
-        "days_to_decision": days_to_decision,
-        "raw_text": raw,
-    }
-
-def split_pasted_decisions(text: str) -> list[str]:
-    text = str(text or "").strip()
-    if not text:
-        return []
-    # Split before manuscript IDs while retaining each ID.
-    parts = re.split(r"(?=\bERJOR-\d{5}-\d{4})", text)
-    return [p.strip() for p in parts if p.strip() and re.search(r"\bERJOR-\d{5}-\d{4}", p)]
-
-def parse_decision_blocks(blocks: Iterable[str]) -> pd.DataFrame:
-    records = [parse_decision_text(b) for b in blocks if str(b).strip()]
-    df = pd.DataFrame(records)
-    if df.empty:
-        return df
-    df["decision_date"] = pd.to_datetime(df["decision_date"], errors="coerce")
-    df["submitted_date"] = pd.to_datetime(df["submitted_date"], errors="coerce")
-    df["days_to_decision"] = pd.to_numeric(df["days_to_decision"], errors="coerce")
-    df = df.drop_duplicates(subset=["manuscript_id", "decision", "decision_date"], keep="last")
-    return df
-
-def parse_uploaded_decision_file(uploaded) -> pd.DataFrame:
-    if uploaded is None:
-        return pd.DataFrame()
-    name = uploaded.name.lower()
-    try:
-        if name.endswith(".ods"):
-            raw = pd.read_excel(uploaded, sheet_name="Inputs", engine="odf", header=None, usecols=[0], nrows=2500)
-            blocks = raw.iloc[:, 0].dropna().astype(str).tolist()
-            blocks = [b for b in blocks if re.search(r"\bERJOR-\d{5}-\d{4}", b)]
-            return parse_decision_blocks(blocks)
-        if name.endswith(".csv"):
-            df = pd.read_csv(uploaded)
-        else:
-            df = pd.read_excel(uploaded)
-        # If this is an exported tracker CSV, standardise dates and return.
-        if "raw_text" in df.columns or "manuscript_id" in df.columns:
-            for col in ["decision_date", "submitted_date"]:
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
-            if "days_to_decision" in df.columns:
-                df["days_to_decision"] = pd.to_numeric(df["days_to_decision"], errors="coerce")
-            return df
-    except Exception as exc:
-        st.error(f"Could not parse uploaded decision file: {exc}")
-    return pd.DataFrame()
-
-def normalise_decision_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    for col in ["manuscript_id", "title", "study_type", "decision", "themes", "raw_text"]:
-        if col not in out.columns:
-            out[col] = ""
-    for col in ["decision_date", "submitted_date"]:
-        out[col] = pd.to_datetime(out[col], errors="coerce")
-    out["days_to_decision"] = pd.to_numeric(out.get("days_to_decision"), errors="coerce")
-    out["decision_month"] = out["decision_date"].dt.to_period("M").astype(str)
-    out["decision_year"] = out["decision_date"].dt.year
-    out["month_name"] = out["decision_date"].dt.strftime("%b")
-    out["month_num"] = out["decision_date"].dt.month
-    out["decision_group"] = out["decision"].replace({"Desk Reject": "Reject"})
-    out.loc[out["decision_group"].isin(["Accept", "Reject"]) == False, "decision_group"] = "Other"
-    return out.drop_duplicates(subset=["manuscript_id", "decision", "decision_date"], keep="last")
-
-def decision_tracker_page() -> None:
-    page_header(
-        "Decision Tracker",
-        "Paste ScholarOne decision text and monitor accept/reject activity in real time",
-        "Editorial decisions by month, study type and topic",
-        TODAY.isoformat(),
-    )
-    st.info("Paste one or more ScholarOne decision text blocks below, or upload your existing ODS/CSV tracker. On Streamlit Cloud, use the CSV download as your backup because local app storage may reset after redeploys.")
-
-    if "decision_records" not in st.session_state:
-        st.session_state["decision_records"] = pd.DataFrame()
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        uploaded = st.file_uploader("Upload existing ERJOR decisions ODS/CSV", type=["ods", "csv", "xlsx"])
-        if uploaded is not None and st.button("Load uploaded decisions"):
-            df_upload = parse_uploaded_decision_file(uploaded)
-            st.session_state["decision_records"] = normalise_decision_df(pd.concat([st.session_state["decision_records"], df_upload], ignore_index=True))
-            st.success(f"Loaded {len(df_upload):,} decision records from upload.")
-    with c2:
-        pasted = st.text_area("Paste new decision text", height=180, placeholder="ERJOR-00118-2026 Submitted: 23-Jan-2026; Last Updated: 23-Jan-2026; In Review: 0sec ... Original Research Article Desk Reject")
-        add_cols = st.columns([1, 1])
-        if add_cols[0].button("Add pasted decisions", type="primary"):
-            blocks = split_pasted_decisions(pasted)
-            df_new = parse_decision_blocks(blocks)
-            st.session_state["decision_records"] = normalise_decision_df(pd.concat([st.session_state["decision_records"], df_new], ignore_index=True))
-            st.success(f"Added {len(df_new):,} parsed decision records.")
-        if add_cols[1].button("Clear session decisions"):
-            st.session_state["decision_records"] = pd.DataFrame()
-            st.warning("Session decision records cleared.")
-
-    df = normalise_decision_df(st.session_state["decision_records"])
-    if df.empty:
-        st.warning("No decision records loaded yet. Upload the ODS tracker or paste a decision block to begin.")
-        return
-
-    years = sorted([int(y) for y in df["decision_year"].dropna().unique()], reverse=True)
-    selected_years = st.multiselect("Years to show", years, default=years[:1] if years else [])
-    filtered = df[df["decision_year"].isin(selected_years)] if selected_years else df
-
-    total = len(filtered)
-    accepts = int((filtered["decision_group"] == "Accept").sum())
-    rejects = int((filtered["decision_group"] == "Reject").sum())
-    acc_rate = accepts / max(accepts + rejects, 1)
-    median_days = filtered["days_to_decision"].median()
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total decisions", f"{total:,}")
-    k2.metric("Accepted", f"{accepts:,}")
-    k3.metric("Rejected", f"{rejects:,}")
-    k4.metric("Acceptance rate", f"{acc_rate:.1%}")
-    k5.metric("Median time to decision", "—" if pd.isna(median_days) else f"{median_days:.0f} days")
-
-    st.divider()
-    chart_df = filtered.dropna(subset=["decision_date"]).copy()
-    if chart_df.empty:
-        st.warning("No valid decision dates available for monthly charts.")
-    else:
-        monthly = chart_df.groupby(["decision_year", "month_num", "month_name", "decision_group"], as_index=False).size().rename(columns={"size": "decisions"})
-        monthly["month_label"] = monthly["decision_year"].astype(int).astype(str) + " " + monthly["month_name"]
-        section_title("Accepts and rejects per month")
-        fig = px.bar(monthly, x="month_label", y="decisions", color="decision_group", barmode="group", color_discrete_map={"Accept": ERJ_TEAL, "Reject": ERJ_RED, "Other": ERJ_GREY})
-        fig.update_layout(height=420, xaxis_title="Month", yaxis_title="Decisions", legend_title="Decision")
-        st.plotly_chart(fig, use_container_width=True)
-
-        section_title("Month-by-month tracker")
-        monthly_total = chart_df.groupby(["decision_year", "month_num", "month_name"], as_index=False).agg(
-            decisions=("manuscript_id", "count"),
-            accepts=("decision_group", lambda s: (s == "Accept").sum()),
-            rejects=("decision_group", lambda s: (s == "Reject").sum()),
-            median_days=("days_to_decision", "median"),
-        )
-        monthly_total["acceptance_rate"] = monthly_total["accepts"] / (monthly_total["accepts"] + monthly_total["rejects"]).clip(lower=1)
-        monthly_total["month_label"] = monthly_total["decision_year"].astype(int).astype(str) + " " + monthly_total["month_name"]
-        fig2 = px.line(monthly_total, x="month_label", y=["decisions", "accepts", "rejects"], markers=True)
-        fig2.update_layout(height=380, xaxis_title="Month", yaxis_title="Count", legend_title="Metric")
-        st.plotly_chart(fig2, use_container_width=True)
-
-    left, right = st.columns(2)
-    with left:
-        section_title("Breakdown by study type")
-        type_counts = filtered.groupby(["study_type", "decision_group"], as_index=False).size().rename(columns={"size": "decisions"}).sort_values("decisions", ascending=False)
-        if not type_counts.empty:
-            fig3 = px.bar(type_counts, x="decisions", y="study_type", color="decision_group", orientation="h", color_discrete_map={"Accept": ERJ_TEAL, "Reject": ERJ_RED, "Other": ERJ_GREY})
-            fig3.update_layout(height=420, yaxis_title="", xaxis_title="Decisions")
-            st.plotly_chart(fig3, use_container_width=True)
-        else:
-            st.caption("No study type data.")
-    with right:
-        section_title("Breakdown by topic")
-        topic_rows = []
-        for _, row in filtered.iterrows():
-            tags = [t.strip() for t in str(row.get("themes", "")).split(";") if t.strip()]
-            if not tags:
-                tags = ["Unclassified"]
-            for tag in tags:
-                topic_rows.append({"theme": tag, "decision_group": row.get("decision_group", "Other")})
-        topic_df = pd.DataFrame(topic_rows)
-        if not topic_df.empty:
-            topic_counts = topic_df.groupby(["theme", "decision_group"], as_index=False).size().rename(columns={"size": "decisions"})
-            top_themes = topic_counts.groupby("theme")["decisions"].sum().sort_values(ascending=False).head(15).index
-            fig4 = px.bar(topic_counts[topic_counts["theme"].isin(top_themes)], x="decisions", y="theme", color="decision_group", orientation="h", color_discrete_map={"Accept": ERJ_TEAL, "Reject": ERJ_RED, "Other": ERJ_GREY})
-            fig4.update_layout(height=420, yaxis_title="", xaxis_title="Decisions")
-            st.plotly_chart(fig4, use_container_width=True)
-        else:
-            st.caption("No topic data.")
-
-    section_title("Median time to decision by month")
-    if not chart_df.empty:
-        med = chart_df.groupby(["decision_year", "month_num", "month_name"], as_index=False)["days_to_decision"].median().dropna()
-        if not med.empty:
-            med["month_label"] = med["decision_year"].astype(int).astype(str) + " " + med["month_name"]
-            fig5 = px.bar(med, x="month_label", y="days_to_decision")
-            fig5.update_layout(height=320, xaxis_title="Month", yaxis_title="Median days")
-            st.plotly_chart(fig5, use_container_width=True)
-
-    section_title("Decision records")
-    show_cols = ["manuscript_id", "title", "submitted_date", "decision_date", "study_type", "decision", "themes", "days_to_decision"]
-    st.dataframe(filtered[show_cols].sort_values("decision_date", ascending=False), use_container_width=True, hide_index=True)
-    st.download_button(
-        "Download decision records CSV",
-        normalise_decision_df(df).to_csv(index=False),
-        "erjor_decision_records.csv",
-        "text/csv",
-    )
-
-
-inject_css()
-sidebar_logo()
-
-with st.sidebar:
-    page = st.radio(
-        "Navigation",
-        [
-            "1. Year to Date",
-            "2. Impact Factor",
-            "3. Decision Tracker",
-        ],
-        label_visibility="collapsed",
-    )
-    st.markdown("---")
-    st.markdown("### Data refresh")
-    mailto = st.text_input("OpenAlex mailto", value=DEFAULT_MAILTO)
-    auto_refresh = st.checkbox("Auto-fetch if empty / stale", value=True)
-    manual_refresh = st.button("Fetch latest data now", type="primary")
-    st.caption("The app fetches ERJOR papers published 0–60 months ago to support year-to-date comparisons and estimated Impact Factor windows.")
-    st.markdown(
-        """
-        <div class="sidebar-footer">
-          <strong>ERJ OPEN RESEARCH</strong><br/>
-          Year-to-date publishing and estimated Impact Factor tracker using OpenAlex.<br/><br/>
-          <span style="opacity:.9">OpenAlex estimates may differ from Web of Science and Google Scholar.</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-if manual_refresh or (auto_refresh and not snapshot_exists_for_today(DB_PATH)):
-    try:
-        fetched = fetch_latest_data(DB_PATH, mailto.strip() or DEFAULT_MAILTO)
-        st.success(f"Fetched {fetched:,} ERJOR works from OpenAlex.")
-        load_data.clear()
-    except Exception as exc:
-        st.error(f"Could not fetch OpenAlex data: {exc}")
-
-works, snaps = load_data(str(DB_PATH))
-if snaps.empty:
-    page_header("ERJOR Editorial Intelligence", "No data loaded yet", "0–36 month ERJOR publication window", None)
-    st.warning("No citation data is available yet. Click **Fetch latest data now** in the sidebar. On GitHub, the included workflow can refresh the data daily.")
+import classify as C
+import fetch_openalex as F
+
+st.set_page_config(page_title="ERJOR Citation Analysis",
+                   page_icon="\U0001F4CA", layout="wide")
+
+WOS_2024 = {"items": 515, "zero": 74, "one": 103, "median": 3, "max": 60}
+
+
+# ---------------------------------------------------------------------------
+# Data acquisition
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def load_openalex(year_from: int, year_to: int, mailto: str) -> pd.DataFrame:
+    src = F.find_source(mailto)
+    works = F.fetch_works(src, year_from, year_to, mailto)
+    return F.flatten(works)
+
+
+@st.cache_data(show_spinner=False)
+def code_papers(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the theme and methodology codebooks."""
+    d = df.copy()
+    d["clean_title"] = d["Item Title"].map(C.normalise)
+
+    th = d["clean_title"].map(lambda t: C.classify(t, C.THEMES))
+    me = d["clean_title"].map(lambda t: C.classify(t, C.METHODS))
+
+    d["Theme"] = [r[0] for r in th]
+    d["Theme_all_matches"] = [r[1] for r in th]
+    d["Theme_rule_hits"] = [r[2] for r in th]
+    d["Methodology"] = [r[0] for r in me]
+    d["Methodology_all_matches"] = [r[1] for r in me]
+    d["Methodology_rule_hits"] = [r[2] for r in me]
+
+    art = d["Document Type"].astype(str).str.strip().eq("Article")
+    unc = d["Methodology"].eq("Other / Unclassified")
+    d.loc[art & unc, "Methodology"] = "Original research - design not stated in title"
+
+    is_rev = d["Document Type"].astype(str).str.strip().eq("Review")
+    keep = d["Methodology"].isin(["Systematic Review / Meta-analysis",
+                                  "Congress/Conference Report",
+                                  "Guideline / Consensus / Delphi"])
+    d.loc[is_rev & ~keep, "Methodology"] = "Narrative Review / Editorial"
+
+    conf = lambda h: "High" if h >= 2 else ("Medium" if h == 1 else "Low")
+    d["Theme_confidence"] = d["Theme_rule_hits"].map(conf)
+    d["Methodology_confidence"] = d["Methodology_rule_hits"].map(conf)
+    d["Needs_review"] = (d["Theme_confidence"].eq("Low")
+                         | d["Methodology_confidence"].eq("Low"))
+
+    d["Number of Citations"] = pd.to_numeric(d["Number of Citations"],
+                                             errors="coerce")
+    d["Zero_cited"] = d["Number of Citations"].eq(0)
+    d["Low_cited_0_1"] = d["Number of Citations"].le(1)
+    return d
+
+
+def summarise(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    g = df.groupby(col, dropna=False).agg(
+        Papers=("Number of Citations", "size"),
+        Zero=("Zero_cited", "sum"),
+        Low_0_1=("Low_cited_0_1", "sum"),
+        Median=("Number of Citations", "median"),
+        Mean=("Number of Citations", "mean"),
+    ).reset_index()
+    g["% zero"] = (g.Zero / g.Papers * 100).round(1)
+    g["% 0-1"] = (g.Low_0_1 / g.Papers * 100).round(1)
+    g["Mean"] = g.Mean.round(2)
+    return g.sort_values("% zero", ascending=False)
+
+
+def bar(df, x, y, title, min_n=1):
+    d = df[df.Papers >= min_n]
+    return (alt.Chart(d, title=title)
+            .mark_bar(cornerRadiusEnd=3, color="#1F3864")
+            .encode(
+                x=alt.X(f"{x}:Q", title=x),
+                y=alt.Y(f"{y}:N", sort="-x", title=None),
+                tooltip=list(d.columns))
+            .properties(height=max(220, 22 * len(d))))
+
+
+def to_excel(sheets: dict) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        for name, d in sheets.items():
+            d.to_excel(xl, sheet_name=name[:31], index=False)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+st.sidebar.title("ERJOR Citation Analysis")
+st.sidebar.caption("Zero-citation and thematic analysis for the editorial "
+                   "meeting")
+
+source = st.sidebar.radio(
+    "Data source",
+    ["OpenAlex (live)", "Upload Web of Science export"],
+    help="OpenAlex needs no login. Use the WoS option if you have a JCR "
+         "citable-items export.")
+
+st.sidebar.divider()
+
+if source == "OpenAlex (live)":
+    mailto = st.sidebar.text_input(
+        "Your email",
+        placeholder="you@example.com",
+        help="Not stored. OpenAlex asks for it to put requests in their "
+             "faster 'polite pool'.")
+    this_jcr = st.sidebar.number_input(
+        "Current JCR window", min_value=2018, max_value=date.today().year,
+        value=2025,
+        help="Citations received during this year, to papers published in "
+             "the two preceding years.")
+    prev_jcr = st.sidebar.number_input(
+        "Comparison window", min_value=2017, max_value=date.today().year,
+        value=2024)
+    citable_only = st.sidebar.checkbox(
+        "Citable items only (Articles + Reviews)", value=True,
+        help="Matches the JCR denominator. Unticking includes editorials and "
+             "letters, which inflates uncitedness.")
+    go = st.sidebar.button("Fetch and analyse", type="primary",
+                           use_container_width=True)
+else:
+    upload = st.sidebar.file_uploader("WoS export (.xlsx)", type=["xlsx"])
+    go = upload is not None
+    this_jcr = prev_jcr = None
+    citable_only = True
+
+st.sidebar.divider()
+st.sidebar.caption("Coding rules are shared with the command-line scripts. "
+                   "Edit classify.py to change them.")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+st.title("ERJ Open Research \u2014 citation analysis")
+
+if not go:
+    st.info("Choose a data source in the sidebar to begin.")
+    with st.expander("What this does", expanded=True):
+        st.markdown("""
+A journal impact factor counts citations received **during one year** by items
+published in the **two preceding years**. OpenAlex records citations per year
+for every paper, so that window can be rebuilt exactly rather than
+approximated.
+
+The app then applies a fixed rule-based coding frame \u2014 disease theme and study
+methodology \u2014 so the same title always produces the same label, and every
+assignment can be traced back to the rule that made it.
+
+**Interpreting the numbers.** OpenAlex indexes more citing sources than Web of
+Science, so it finds *fewer* uncited papers. Compare OpenAlex against OpenAlex,
+never against a JCR figure from a previous year. The calibration panel shows
+the size of that gap against the known 2024 Web of Science result.
+        """)
     st.stop()
 
-if page.startswith("1."):
-    year_to_date_page(snaps)
-elif page.startswith("2."):
-    impact_factor_page(snaps)
+# --- load ---
+if source == "OpenAlex (live)":
+    if not mailto or "@" not in mailto:
+        st.error("Please enter a valid email address in the sidebar. "
+                 "OpenAlex requires it for API access.")
+        st.stop()
+    lo = min(prev_jcr, this_jcr) - 2
+    hi = this_jcr - 1
+    with st.spinner(f"Fetching {lo}\u2013{hi} from OpenAlex\u2026"):
+        try:
+            raw = load_openalex(lo, hi, mailto)
+        except Exception as exc:
+            st.error(f"OpenAlex request failed: {exc}")
+            st.stop()
+    if raw.empty:
+        st.error("No works returned. Check the year range.")
+        st.stop()
+
+    cur = F.build_window(raw, this_jcr, citable_only)
+    prev = F.build_window(raw, prev_jcr, citable_only)
+    cur_l, prev_l = code_papers(cur), code_papers(prev)
+    label_cur, label_prev = f"{this_jcr} window", f"{prev_jcr} window"
 else:
-    decision_tracker_page()
+    try:
+        raw = C.load_wos(upload)
+    except Exception as exc:
+        st.error(f"Could not read that file: {exc}")
+        st.stop()
+    cur_l = code_papers(raw)
+    prev_l = None
+    label_cur = "Uploaded dataset"
+    label_prev = None
+
+# --- headline ---
+st.subheader(label_cur)
+c = cur_l["Number of Citations"]
+cols = st.columns(5)
+metrics = [
+    ("Citable items", f"{len(cur_l)}", None),
+    ("Zero citations", f"{int((c == 0).sum())}", f"{(c == 0).mean() * 100:.1f}%"),
+    ("0\u20131 citations", f"{int((c <= 1).sum())}", f"{(c <= 1).mean() * 100:.1f}%"),
+    ("Median", f"{c.median():.0f}", None),
+    ("10+ citations", f"{int((c >= 10).sum())}", f"{(c >= 10).mean() * 100:.1f}%"),
+]
+for col, (lab, val, delta) in zip(cols, metrics):
+    col.metric(lab, val, delta, delta_color="off")
+
+if prev_l is not None:
+    pc = prev_l["Number of Citations"]
+    d_zero = (c == 0).mean() * 100 - (pc == 0).mean() * 100
+    d_low = (c <= 1).mean() * 100 - (pc <= 1).mean() * 100
+    st.caption(
+        f"Against the {label_prev}: zero-citation rate "
+        f"{'down' if d_zero < 0 else 'up'} {abs(d_zero):.1f} percentage points; "
+        f"0\u20131 rate {'down' if d_low < 0 else 'up'} {abs(d_low):.1f} points. "
+        f"Both windows come from the same database, so they are comparable.")
+
+tabs = st.tabs(["Overview", "By theme", "By methodology", "Theme \u00d7 method",
+                "Zero-cited papers", "Year on year", "Calibration", "Codebook"])
+
+# --- overview ---
+with tabs[0]:
+    left, right = st.columns(2)
+    with left:
+        band = (cur_l["Number of Citations"]
+                .clip(upper=15).value_counts().sort_index().reset_index())
+        band.columns = ["Citations", "Papers"]
+        st.altair_chart(
+            alt.Chart(band, title="Citation distribution (15+ grouped)")
+            .mark_bar(color="#1F3864")
+            .encode(x=alt.X("Citations:O"), y="Papers:Q",
+                    tooltip=["Citations", "Papers"]),
+            use_container_width=True)
+    with right:
+        yr = summarise(cur_l, "Publication Year")
+        st.dataframe(yr, use_container_width=True, hide_index=True)
+    top = cur_l.nlargest(10, "Number of Citations")[
+        ["Item Title", "Publication Year", "Theme", "Methodology",
+         "Number of Citations"]]
+    st.markdown("**Most cited in this window**")
+    st.dataframe(top, use_container_width=True, hide_index=True)
+
+# --- theme ---
+with tabs[1]:
+    min_n = st.slider("Minimum papers per theme", 1, 20, 8, key="tn")
+    th = summarise(cur_l, "Theme")
+    st.altair_chart(bar(th, "% zero", "Theme",
+                        "Zero-citation rate by theme", min_n),
+                    use_container_width=True)
+    st.dataframe(th, use_container_width=True, hide_index=True)
+    st.caption("Rate alone can mislead \u2014 a theme with four papers and one "
+               "zero scores 25%. Read it against the Papers column.")
+
+# --- methodology ---
+with tabs[2]:
+    min_m = st.slider("Minimum papers per method", 1, 20, 8, key="mn")
+    me = summarise(cur_l, "Methodology")
+    st.altair_chart(bar(me, "% zero", "Methodology",
+                        "Zero-citation rate by methodology", min_m),
+                    use_container_width=True)
+    st.dataframe(me, use_container_width=True, hide_index=True)
+
+# --- cross-tab ---
+with tabs[3]:
+    st.markdown("**Zero-cited / total papers, by theme and methodology**")
+    n_ct = pd.crosstab(cur_l.Theme, cur_l.Methodology)
+    z_ct = pd.crosstab(cur_l.Theme, cur_l.Methodology,
+                       values=cur_l.Zero_cited, aggfunc="sum").fillna(0)
+    floor = st.slider("Hide cells with fewer than N papers", 1, 10, 3)
+    long = []
+    for t in n_ct.index:
+        for m in n_ct.columns:
+            tot = int(n_ct.loc[t, m])
+            if tot >= floor:
+                long.append({"Theme": t, "Methodology": m, "Papers": tot,
+                             "Zero": int(z_ct.loc[t, m]),
+                             "% zero": round(z_ct.loc[t, m] / tot * 100, 1)})
+    if long:
+        ld = pd.DataFrame(long)
+        st.altair_chart(
+            alt.Chart(ld).mark_rect().encode(
+                x=alt.X("Methodology:N", axis=alt.Axis(labelAngle=-40)),
+                y=alt.Y("Theme:N", title=None),
+                color=alt.Color("% zero:Q",
+                                scale=alt.Scale(scheme="orangered")),
+                tooltip=["Theme", "Methodology", "Papers", "Zero", "% zero"]
+            ).properties(height=max(300, 20 * ld.Theme.nunique())),
+            use_container_width=True)
+        st.dataframe(ld.sort_values("% zero", ascending=False),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No cells meet the minimum. Lower the threshold.")
+
+# --- zero-cited ---
+with tabs[4]:
+    z = cur_l[cur_l.Zero_cited].copy()
+    st.markdown(f"**{len(z)} papers with zero citations in this window**")
+    st.caption("Theme and Methodology are editable. Correct anything "
+               "misclassified, then download \u2014 send the file back and the "
+               "rules can be updated so the fix persists next year.")
+    show = z[["Item Title", "Publication Year", "Theme", "Methodology",
+              "Theme_confidence", "Methodology_confidence"]]
+    edited = st.data_editor(
+        show, use_container_width=True, hide_index=True, num_rows="fixed",
+        column_config={
+            "Theme": st.column_config.SelectboxColumn(
+                options=sorted({t for t, _ in C.THEMES} | {"Other / Unclassified"})),
+            "Methodology": st.column_config.SelectboxColumn(
+                options=sorted({m for m, _ in C.METHODS} |
+                               {"Original research - design not stated in title",
+                                "Other / Unclassified"})),
+        })
+    st.download_button("Download zero-cited papers (CSV)",
+                       edited.to_csv(index=False).encode(),
+                       "erjor_zero_cited_reviewed.csv", "text/csv")
+
+# --- year on year ---
+with tabs[5]:
+    if prev_l is None:
+        st.info("Year-on-year comparison needs the OpenAlex source, which "
+                "builds both windows.")
+    else:
+        a = summarise(prev_l, "Theme")[["Theme", "Papers", "Zero", "% zero"]]
+        b = summarise(cur_l, "Theme")[["Theme", "Papers", "Zero", "% zero"]]
+        m = a.merge(b, on="Theme", how="outer",
+                    suffixes=(f" {prev_jcr}", f" {this_jcr}")).fillna(0)
+        m["Change (pts)"] = (m[f"% zero {this_jcr}"]
+                             - m[f"% zero {prev_jcr}"]).round(1)
+        st.markdown("**Movement in zero-citation rate by theme**")
+        st.dataframe(m.sort_values("Change (pts)"),
+                     use_container_width=True, hide_index=True)
+
+        overlap = sorted(set(prev_l["Publication Year"])
+                         & set(cur_l["Publication Year"]))
+        if overlap:
+            yr = overlap[0]
+            p = prev_l[prev_l["Publication Year"] == yr][["UT", "Item Title",
+                                                          "Number of Citations",
+                                                          "Theme"]]
+            q = cur_l[cur_l["Publication Year"] == yr][["UT",
+                                                        "Number of Citations"]]
+            j = p.merge(q, on="UT", suffixes=(f"_{prev_jcr}", f"_{this_jcr}"))
+            was_zero = j[j[f"Number of Citations_{prev_jcr}"] == 0]
+            still = was_zero[was_zero[f"Number of Citations_{this_jcr}"] == 0]
+            st.divider()
+            st.markdown(f"**Catch-up analysis \u2014 {yr} papers, "
+                        f"tracked across both windows**")
+            k1, k2, k3 = st.columns(3)
+            k1.metric(f"Zero in {prev_jcr}", len(was_zero))
+            k2.metric(f"Still zero in {this_jcr}", len(still))
+            if len(was_zero):
+                k3.metric("Picked up citations",
+                          f"{(1 - len(still) / len(was_zero)) * 100:.0f}%")
+            st.caption(
+                "Papers appearing in both windows are the same papers, matched "
+                "on identifier. Those that stay at zero are persistently "
+                "uncited rather than merely slow \u2014 that distinction is what "
+                "makes this actionable.")
+            st.dataframe(still[["Item Title", "Theme"]],
+                         use_container_width=True, hide_index=True)
+
+# --- calibration ---
+with tabs[6]:
+    st.markdown("**Sanity check against Web of Science**")
+    if source == "OpenAlex (live)" and 2024 in (this_jcr, prev_jcr):
+        w = cur_l if this_jcr == 2024 else prev_l
+        wc = w["Number of Citations"]
+        comp = pd.DataFrame({
+            "Measure": ["Citable items", "Zero citations", "One citation",
+                        "Median citations", "Max citations"],
+            "Web of Science (JCR 2024)": [WOS_2024["items"], WOS_2024["zero"],
+                                          WOS_2024["one"], WOS_2024["median"],
+                                          WOS_2024["max"]],
+            "OpenAlex (this app)": [len(w), int((wc == 0).sum()),
+                                    int((wc == 1).sum()),
+                                    int(wc.median()), int(wc.max())],
+        })
+        st.dataframe(comp, use_container_width=True, hide_index=True)
+        st.caption(
+            "OpenAlex should find somewhat fewer uncited papers, because it "
+            "counts citations from a wider set of sources. Its document typing "
+            "is also algorithmic, so the denominator will not match exactly. "
+            "A large discrepancy \u2014 say the item count differing by more than "
+            "20% \u2014 means something is wrong and the numbers should not be "
+            "presented.")
+    else:
+        st.info("Set one of the windows to 2024 to compare against the known "
+                "Web of Science result.")
+
+# --- codebook ---
+with tabs[7]:
+    st.caption("Rules are applied in the order shown. A paper scores one point "
+               "per distinct pattern matched; highest score wins, ties broken "
+               "by position in this list.")
+    for name, book in (("Disease themes", C.THEMES),
+                       ("Methodologies", C.METHODS)):
+        st.markdown(f"**{name}**")
+        st.dataframe(pd.DataFrame([
+            {"Priority": i, "Label": lab,
+             "Patterns": "; ".join(p.replace("\\b", "") for p in pats)}
+            for i, (lab, pats) in enumerate(book, 1)]),
+            use_container_width=True, hide_index=True)
+
+# --- downloads ---
+st.divider()
+d1, d2 = st.columns(2)
+d1.download_button("Download labelled dataset (CSV)",
+                   cur_l.to_csv(index=False).encode(),
+                   f"erjor_labelled_{label_cur.replace(' ', '_')}.csv",
+                   "text/csv", use_container_width=True)
+sheets = {"Labelled data": cur_l, "By theme": summarise(cur_l, "Theme"),
+          "By methodology": summarise(cur_l, "Methodology"),
+          "Zero-cited": cur_l[cur_l.Zero_cited]}
+if prev_l is not None:
+    sheets["Previous window"] = prev_l
+d2.download_button("Download full workbook (Excel)", to_excel(sheets),
+                   "ERJOR_Citation_Analysis.xlsx",
+                   "application/vnd.openxmlformats-officedocument."
+                   "spreadsheetml.sheet", use_container_width=True)

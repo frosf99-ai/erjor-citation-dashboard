@@ -1,294 +1,243 @@
-"""Fetch ERJ Open Research citation snapshots from OpenAlex.
-
-The dashboard can call these functions directly on Streamlit Cloud, so users do
-not need to run this script manually. If you do run it locally:
-
-    python fetch_openalex.py --mailto your.email@example.com
-
-OpenAlex provides current citation counts, not exact month-by-month historical
-citation dates for every citing work. The dashboard therefore stores daily
-snapshots locally and uses OpenAlex counts_by_year to estimate early citation
-activity where exact first-12-month counts are unavailable.
+#!/usr/bin/env python3
 """
-from __future__ import annotations
+Pull ERJ Open Research citable items from OpenAlex and rebuild JCR-style
+citation windows.
+
+WHY THIS WORKS
+--------------
+A journal impact factor window counts citations received *during a single
+year* by items published in the two preceding years. OpenAlex exposes exactly
+that via each work's `counts_by_year` field, so the metric can be rebuilt
+rather than approximated:
+
+    2024 window  = citations during 2024 to items published 2022 + 2023
+    2025 window  = citations during 2025 to items published 2023 + 2024
+
+The 2024 window reproduces the Web of Science export you already have, which
+gives you a direct calibration of how far the two databases diverge.
+
+USAGE
+-----
+    pip install requests pandas openpyxl
+    python fetch_openalex.py --mailto you@example.com
+
+OUTPUT
+------
+    openalex_window_2024.csv   pub 2022-2023, citations during 2024
+    openalex_window_2025.csv   pub 2023-2024, citations during 2025
+    openalex_raw_works.csv     every work retrieved, all years
+    calibration.txt            OpenAlex vs Web of Science comparison
+
+Both window files use the same column names as the WoS export, so classify.py
+runs on them unmodified.
+
+No API key or institutional access is required.
+"""
 
 import argparse
-import datetime as dt
-import json
-import sqlite3
-from calendar import monthrange
+import sys
 import time
-from typing import Any
 
-import requests
+import pandas as pd
 
-DB_PATH = "erjor_citations.sqlite"
-OPENALEX_BASE = "https://api.openalex.org/works"
-ERJOR_ISSN = "2312-0541"
-DEFAULT_MIN_AGE_MONTHS = 12
-DEFAULT_MAX_AGE_MONTHS = 36
+try:
+    import requests
+except ImportError:
+    sys.exit("Please run: pip install requests pandas openpyxl")
 
-SELECT_FIELDS = ",".join([
-    "id",
-    "doi",
-    "display_name",
-    "publication_date",
-    "publication_year",
-    "cited_by_count",
-    "counts_by_year",
-    "authorships",
-    "primary_location",
-    "locations_count",
-    "type",
-    "type_crossref",
-    "ids",
-    "concepts",
-    "primary_topic",
-    "topics",
-    "keywords",
+API = "https://api.openalex.org"
+ISSN = "2312-0541"          # ERJ Open Research
+
+# Only these fields are requested, which keeps responses small and fast.
+SELECT = ",".join([
+    "id", "doi", "title", "publication_year", "publication_date",
+    "type", "cited_by_count", "counts_by_year", "authorships",
+    "primary_topic", "open_access",
 ])
 
 
-def connect(db_path: str) -> sqlite3.Connection:
-    con = sqlite3.connect(db_path)
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS works (
-            openalex_id TEXT PRIMARY KEY,
-            doi TEXT,
-            title TEXT,
-            publication_date TEXT,
-            publication_year INTEGER,
-            work_type TEXT,
-            article_type TEXT,
-            source_display_name TEXT,
-            landing_page_url TEXT,
-            authors TEXT,
-            first_author TEXT,
-            institutions TEXT,
-            concepts_json TEXT,
-            topics_json TEXT,
-            keywords_json TEXT,
-            counts_by_year_json TEXT,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS citation_snapshots (
-            snapshot_date TEXT NOT NULL,
-            openalex_id TEXT NOT NULL,
-            cited_by_count INTEGER NOT NULL,
-            PRIMARY KEY (snapshot_date, openalex_id),
-            FOREIGN KEY(openalex_id) REFERENCES works(openalex_id)
-        )
-        """
-    )
-    # Lightweight migrations for older local databases.
-    cols = {row[1] for row in con.execute("PRAGMA table_info(works)").fetchall()}
-    migrations = {
-        "article_type": "ALTER TABLE works ADD COLUMN article_type TEXT",
-        "first_author": "ALTER TABLE works ADD COLUMN first_author TEXT",
-        "concepts_json": "ALTER TABLE works ADD COLUMN concepts_json TEXT",
-        "topics_json": "ALTER TABLE works ADD COLUMN topics_json TEXT",
-        "keywords_json": "ALTER TABLE works ADD COLUMN keywords_json TEXT",
-        "counts_by_year_json": "ALTER TABLE works ADD COLUMN counts_by_year_json TEXT",
-    }
-    for col, sql in migrations.items():
-        if col not in cols:
-            con.execute(sql)
-    return con
+def get(url, params, tries=4):
+    """GET with simple exponential backoff."""
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=60)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503):
+                time.sleep(2 ** attempt)
+                continue
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            if attempt == tries - 1:
+                raise
+            print(f"    retry after error: {exc}")
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"Failed after {tries} attempts: {url}")
 
 
-def add_months(date_value: dt.date, months: int) -> dt.date:
-    month = date_value.month - 1 + months
-    year = date_value.year + month // 12
-    month = month % 12 + 1
-    day = min(date_value.day, monthrange(year, month)[1])
-    return dt.date(year, month, day)
+def find_source(mailto):
+    """Resolve the journal's OpenAlex source ID from its ISSN."""
+    data = get(f"{API}/sources", {
+        "filter": f"issn:{ISSN}",
+        "select": "id,display_name,issn_l,works_count",
+        "mailto": mailto,
+    })
+    results = data.get("results", [])
+    if not results:
+        sys.exit(f"No OpenAlex source found for ISSN {ISSN}")
+    src = results[0]
+    sid = src["id"].rsplit("/", 1)[-1]
+    print(f"Source: {src['display_name']}  ({sid}, "
+          f"{src.get('works_count', '?')} works indexed)")
+    return sid
 
 
-def publication_window(
-    as_of: dt.date | None = None,
-    min_age_months: int = DEFAULT_MIN_AGE_MONTHS,
-    max_age_months: int = DEFAULT_MAX_AGE_MONTHS,
-) -> tuple[str, str]:
-    as_of = as_of or dt.date.today()
-    start_date = add_months(as_of, -max_age_months)
-    end_date = add_months(as_of, -min_age_months)
-    return start_date.isoformat(), end_date.isoformat()
+def fetch_works(source_id, year_from, year_to, mailto):
+    """Cursor-paginate every work in the given publication-year range."""
+    works, cursor, page = [], "*", 0
+    while cursor:
+        page += 1
+        data = get(f"{API}/works", {
+            "filter": (f"primary_location.source.id:{source_id},"
+                       f"publication_year:{year_from}-{year_to}"),
+            "select": SELECT,
+            "per-page": 200,
+            "cursor": cursor,
+            "mailto": mailto,
+        })
+        batch = data.get("results", [])
+        works.extend(batch)
+        total = data.get("meta", {}).get("count", 0)
+        print(f"  page {page}: {len(works)}/{total}")
+        cursor = data.get("meta", {}).get("next_cursor")
+        if not batch:
+            break
+        time.sleep(0.15)          # stay well inside the rate limit
+    return works
 
 
-def safe_get(obj: dict[str, Any] | None, path: list[str], default: Any = None) -> Any:
-    cur: Any = obj or {}
-    for key in path:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(key)
-        if cur is None:
-            return default
-    return cur
+def flatten(works):
+    """One row per work, with citations-per-year expanded into columns."""
+    rows = []
+    for w in works:
+        by_year = {c["year"]: c["cited_by_count"]
+                   for c in (w.get("counts_by_year") or [])}
+        auths = w.get("authorships") or []
+        names = [a.get("author", {}).get("display_name", "") for a in auths]
+        countries = sorted({c for a in auths
+                            for c in (a.get("countries") or [])})
+        topic = (w.get("primary_topic") or {}).get("display_name", "")
+        rows.append({
+            "openalex_id": w["id"].rsplit("/", 1)[-1],
+            "doi": (w.get("doi") or "").replace("https://doi.org/", ""),
+            "Item Title": w.get("title") or "",
+            "Authors": ";".join(names[:10]),
+            "n_authors": len(names),
+            "countries": ";".join(countries),
+            "Publication Year": w.get("publication_year"),
+            "publication_date": w.get("publication_date"),
+            "openalex_type": w.get("type"),
+            "primary_topic": topic,
+            "is_oa": (w.get("open_access") or {}).get("is_oa"),
+            "cited_by_count_total": w.get("cited_by_count", 0),
+            "cites_2022": by_year.get(2022, 0),
+            "cites_2023": by_year.get(2023, 0),
+            "cites_2024": by_year.get(2024, 0),
+            "cites_2025": by_year.get(2025, 0),
+            "cites_2026": by_year.get(2026, 0),
+        })
+    return pd.DataFrame(rows)
 
 
-def extract_authors(authorships: list[dict[str, Any]]) -> tuple[str, str]:
-    names = []
-    for a in authorships or []:
-        name = safe_get(a, ["author", "display_name"])
-        if name:
-            names.append(name)
-    return "; ".join(names), (names[0] if names else "")
+# OpenAlex types that correspond to JCR "citable items"
+CITABLE = {"article", "review"}
+
+TYPE_MAP = {"article": "Article", "review": "Review"}
 
 
-def extract_institutions(authorships: list[dict[str, Any]]) -> str:
-    institutions: list[str] = []
-    seen: set[str] = set()
-    for a in authorships or []:
-        for inst in a.get("institutions", []) or []:
-            name = inst.get("display_name")
-            if name and name not in seen:
-                seen.add(name)
-                institutions.append(name)
-    return "; ".join(institutions)
+def build_window(df, jcr_year, citable_only=True):
+    """Items published in the two preceding years, cited during jcr_year."""
+    pub_years = [jcr_year - 2, jcr_year - 1]
+    w = df[df["Publication Year"].isin(pub_years)].copy()
+    if citable_only:
+        w = w[w["openalex_type"].isin(CITABLE)]
+    w["Number of Citations"] = w[f"cites_{jcr_year}"]
+    w["Document Type"] = w["openalex_type"].map(TYPE_MAP).fillna("Other")
+    w["UT"] = w["openalex_id"]
+    w["Source Title"] = "ERJ OPEN RESEARCH"
+    w["JCR_window"] = jcr_year
+    return w.sort_values(["Publication Year", "Number of Citations"],
+                         ascending=[True, False])
 
 
-def infer_article_type(work: dict[str, Any]) -> str:
-    raw = " ".join(str(x or "") for x in [work.get("type"), work.get("type_crossref")]).lower()
-    title = str(work.get("display_name") or "").lower()
-    if "review" in raw or "systematic review" in title or "meta-analysis" in title or "meta analysis" in title:
-        return "Review"
-    if "editorial" in raw or title.startswith("editorial"):
-        return "Editorial"
-    if "letter" in raw or "correspondence" in raw:
-        return "Correspondence"
-    if "case-report" in raw or "case report" in title:
-        return "Case report"
-    if "brief-report" in raw or "short report" in title:
-        return "Short report"
-    if "article" in raw or "journal-article" in raw:
-        return "Original research"
-    return work.get("type") or "Unknown"
+def describe(w, label):
+    n = len(w)
+    c = w["Number of Citations"]
+    return (f"{label}\n"
+            f"  citable items      : {n}\n"
+            f"  zero citations     : {int((c == 0).sum())} "
+            f"({(c == 0).mean() * 100:.1f}%)\n"
+            f"  one citation       : {int((c == 1).sum())} "
+            f"({(c == 1).mean() * 100:.1f}%)\n"
+            f"  0-1 citations      : {int((c <= 1).sum())} "
+            f"({(c <= 1).mean() * 100:.1f}%)\n"
+            f"  10+ citations      : {int((c >= 10).sum())}\n"
+            f"  median / mean / max: {c.median():.0f} / {c.mean():.2f} / "
+            f"{int(c.max())}\n")
 
 
-def fetch_page(cursor: str, mailto: str | None, start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
-    if start_date is None or end_date is None:
-        start_date, end_date = publication_window()
-    filters = [
-        f"primary_location.source.issn:{ERJOR_ISSN}",
-        f"from_publication_date:{start_date}",
-        f"to_publication_date:{end_date}",
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mailto", required=True,
+                    help="Your email. Puts requests in OpenAlex's faster "
+                         "'polite pool'. Not stored or published.")
+    ap.add_argument("--from-year", type=int, default=2022)
+    ap.add_argument("--to-year", type=int, default=2024)
+    ap.add_argument("--include-noncitable", action="store_true",
+                    help="Keep editorials, letters and errata as well as "
+                         "articles and reviews")
+    args = ap.parse_args()
+
+    src = find_source(args.mailto)
+
+    print(f"\nFetching works {args.from_year}-{args.to_year} ...")
+    works = fetch_works(src, args.from_year, args.to_year, args.mailto)
+    df = flatten(works)
+    df.to_csv("openalex_raw_works.csv", index=False)
+    print(f"\nRetrieved {len(df)} works -> openalex_raw_works.csv")
+    print("\nBy publication year and type:")
+    print(pd.crosstab(df["Publication Year"], df["openalex_type"]).to_string())
+
+    citable = not args.include_noncitable
+    w24 = build_window(df, 2024, citable)
+    w25 = build_window(df, 2025, citable)
+    w24.to_csv("openalex_window_2024.csv", index=False)
+    w25.to_csv("openalex_window_2025.csv", index=False)
+
+    report = [
+        "ERJOR citation windows rebuilt from OpenAlex",
+        f"retrieved {pd.Timestamp.today():%Y-%m-%d}",
+        "",
+        describe(w24, "2024 window (pub 2022-2023, cited during 2024)"),
+        describe(w25, "2025 window (pub 2023-2024, cited during 2025)"),
+        "CALIBRATION against Web of Science JCR 2024",
+        "  WoS reported: 515 citable items, 74 zero (14.4%), "
+        "103 one (19.9%), median 3, max 60",
+        f"  OpenAlex    : {len(w24)} citable items, "
+        f"{int((w24['Number of Citations'] == 0).sum())} zero "
+        f"({(w24['Number of Citations'] == 0).mean() * 100:.1f}%), "
+        f"median {w24['Number of Citations'].median():.0f}",
+        "",
+        "  Differences are expected. OpenAlex indexes a wider set of citing",
+        "  sources than Web of Science, so it should find FEWER uncited",
+        "  papers. Its document typing is also algorithmic, so the citable",
+        "  denominator will not match exactly. Report the gap rather than",
+        "  presenting either figure as the truth.",
     ]
-    params = {
-        "filter": ",".join(filters),
-        "select": SELECT_FIELDS,
-        "per-page": 200,
-        "cursor": cursor,
-        "sort": "publication_date:desc",
-    }
-    if mailto:
-        params["mailto"] = mailto
-    response = requests.get(OPENALEX_BASE, params=params, timeout=60)
-    response.raise_for_status()
-    return response.json()
-
-
-def upsert_work(con: sqlite3.Connection, work: dict[str, Any], snapshot_date: str) -> None:
-    location = work.get("primary_location") or {}
-    source = location.get("source") or {}
-    authors, first_author = extract_authors(work.get("authorships", []))
-    con.execute(
-        """
-        INSERT INTO works (
-            openalex_id, doi, title, publication_date, publication_year,
-            work_type, article_type, source_display_name, landing_page_url,
-            authors, first_author, institutions, concepts_json, topics_json,
-            keywords_json, counts_by_year_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(openalex_id) DO UPDATE SET
-            doi=excluded.doi,
-            title=excluded.title,
-            publication_date=excluded.publication_date,
-            publication_year=excluded.publication_year,
-            work_type=excluded.work_type,
-            article_type=excluded.article_type,
-            source_display_name=excluded.source_display_name,
-            landing_page_url=excluded.landing_page_url,
-            authors=excluded.authors,
-            first_author=excluded.first_author,
-            institutions=excluded.institutions,
-            concepts_json=excluded.concepts_json,
-            topics_json=excluded.topics_json,
-            keywords_json=excluded.keywords_json,
-            counts_by_year_json=excluded.counts_by_year_json,
-            updated_at=excluded.updated_at
-        """,
-        (
-            work.get("id"),
-            work.get("doi"),
-            work.get("display_name"),
-            work.get("publication_date"),
-            work.get("publication_year"),
-            work.get("type"),
-            infer_article_type(work),
-            source.get("display_name"),
-            location.get("landing_page_url"),
-            authors,
-            first_author,
-            extract_institutions(work.get("authorships", [])),
-            json.dumps(work.get("concepts") or []),
-            json.dumps({"primary_topic": work.get("primary_topic"), "topics": work.get("topics") or []}),
-            json.dumps(work.get("keywords") or []),
-            json.dumps(work.get("counts_by_year") or []),
-            dt.datetime.now(dt.UTC).isoformat(),
-        ),
-    )
-    con.execute(
-        """
-        INSERT INTO citation_snapshots (snapshot_date, openalex_id, cited_by_count)
-        VALUES (?, ?, ?)
-        ON CONFLICT(snapshot_date, openalex_id) DO UPDATE SET
-            cited_by_count=excluded.cited_by_count
-        """,
-        (snapshot_date, work.get("id"), int(work.get("cited_by_count") or 0)),
-    )
-
-
-def fetch_window(db_path: str, mailto: str | None, start_date: str, end_date: str, snapshot_date: str | None = None) -> int:
-    snapshot_date = snapshot_date or dt.date.today().isoformat()
-    con = connect(db_path)
-    cursor = "*"
-    total = 0
-    while True:
-        data = fetch_page(cursor, mailto, start_date, end_date)
-        results = data.get("results", [])
-        if not results:
-            break
-        with con:
-            for work in results:
-                upsert_work(con, work, snapshot_date)
-                total += 1
-        next_cursor = data.get("meta", {}).get("next_cursor")
-        if not next_cursor or next_cursor == cursor:
-            break
-        cursor = next_cursor
-        time.sleep(0.2)
-    con.close()
-    return total
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--db", default=DB_PATH)
-    parser.add_argument("--mailto", default=None, help="Recommended by OpenAlex for polite API usage")
-    parser.add_argument("--snapshot-date", default=dt.date.today().isoformat())
-    parser.add_argument("--min-age-months", type=int, default=DEFAULT_MIN_AGE_MONTHS)
-    parser.add_argument("--max-age-months", type=int, default=DEFAULT_MAX_AGE_MONTHS)
-    args = parser.parse_args()
-    as_of = dt.date.fromisoformat(args.snapshot_date)
-    start_date, end_date = publication_window(as_of, args.min_age_months, args.max_age_months)
-    total = fetch_window(args.db, args.mailto, start_date, end_date, args.snapshot_date)
-    print(f"Saved {total} ERJOR works published {start_date} to {end_date} for snapshot {args.snapshot_date} into {args.db}")
+    text = "\n".join(report)
+    open("calibration.txt", "w").write(text)
+    print("\n" + text)
+    print("\nNext: python classify.py openalex_window_2025.csv labelled_2025.csv")
 
 
 if __name__ == "__main__":
